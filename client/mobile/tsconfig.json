@@ -1,0 +1,12 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "@/*": ["./src/*"],
+      "@whatsapp-pro/shared-types": ["./src/shared-types"],
+      "@whatsapp-pro/shared-types/*": ["./src/shared-types/*"]
+    }
+  },
+  "include": ["**/*.ts", "**/*.tsx"]
+}
