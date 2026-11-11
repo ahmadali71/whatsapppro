@@ -5,7 +5,11 @@ import { StatusesModule } from '../statuses/statuses.module';
 import { TasksService } from './tasks.service';
 
 @Module({
-  imports: [ScheduleModule.forRoot(), StatusesModule, PrivacyModule],
+  imports: [
+    ...(process.env.VERCEL ? [] : [ScheduleModule.forRoot()]),
+    StatusesModule,
+    PrivacyModule,
+  ],
   providers: [TasksService],
   exports: [TasksService],
 })
