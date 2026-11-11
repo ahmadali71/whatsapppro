@@ -30,6 +30,8 @@ export interface IceServerConfig {
  */
 export const MAX_MESH_PARTICIPANTS = 8;
 const CALL_REDIS_TTL_SECONDS = 60 * 60 * 6; // 6 hours
+const CALL_SIGNAL_QUEUE_TTL_SECONDS = 120; // 2 minutes for HTTP signaling fallback
+const INCOMING_CALL_WINDOW_MS = 90_000; // 90 seconds
 
 @Injectable()
 export class CallsService {
@@ -184,7 +186,9 @@ export class CallsService {
             data: { leftAt: now },
           });
         });
-        await this.redis.del(`call:peers:${existingActiveCall.id}`);
+        await this.safeRedis('del call peers on stale cleanup', () =>
+          this.redis.del(`call:peers:${existingActiveCall.id}`),
+        );
         this.logger.warn(
           `Auto-closed stale ${existingActiveCall.status} call ${existingActiveCall.id} (>90s) before initiating new call`,
         );
@@ -227,8 +231,10 @@ export class CallsService {
       return createdCall;
     });
 
-    await this.redis.sadd(`call:peers:${call.id}`, callerId);
-    await this.redis.expire(`call:peers:${call.id}`, CALL_REDIS_TTL_SECONDS);
+    await this.safeRedis('sadd caller to call peers', async () => {
+      await this.redis.sadd(`call:peers:${call.id}`, callerId);
+      await this.redis.expire(`call:peers:${call.id}`, CALL_REDIS_TTL_SECONDS);
+    });
 
     const memberCount = conversation.members.length;
     const webrtcConfig = this.getWebRtcConfig(memberCount);
@@ -347,25 +353,34 @@ export class CallsService {
       },
     });
 
-    await this.redis.sadd(`call:peers:${callId}`, userId);
-    await this.redis.expire(`call:peers:${callId}`, CALL_REDIS_TTL_SECONDS);
+    await this.safeRedis('sadd peer on joinCall', async () => {
+      await this.redis.sadd(`call:peers:${callId}`, userId);
+      await this.redis.expire(`call:peers:${callId}`, CALL_REDIS_TTL_SECONDS);
+    });
 
     const activePeerIds = activeParticipantsBeforeJoin.map((p) => p.userId);
     const topology = totalProjected > 2 ? 'mesh' : 'p2p';
+    const joinSignalPayload = {
+      callId,
+      fromUserId: userId,
+      type: 'peer_joined',
+      topology,
+      activePeerIds,
+      participant,
+    };
 
     // Notify existing peers in call:{callId} so each peer establishes a mesh RTCPeerConnection
-    this.emitToCallRoom(
-      callId,
-      'call_signal',
-      {
-        callId,
-        fromUserId: userId,
-        type: 'peer_joined',
-        topology,
-        activePeerIds,
-        participant,
-      },
-      userId,
+    this.emitToCallRoom(callId, 'call_signal', joinSignalPayload, userId);
+
+    // Queue 'peer_joined' signal in Redis for HTTP polling fallback (Vercel serverless)
+    const queueTargets = new Set(activePeerIds);
+    if (call.callerId && call.callerId !== userId) {
+      queueTargets.add(call.callerId);
+    }
+    await Promise.all(
+      Array.from(queueTargets).map((peerId) =>
+        this.enqueueCallSignal(callId, peerId, joinSignalPayload),
+      ),
     );
 
     return {
@@ -398,7 +413,9 @@ export class CallsService {
       data: { leftAt: now },
     });
 
-    await this.redis.srem(`call:peers:${callId}`, userId);
+    await this.safeRedis('srem peer on endCall', () =>
+      this.redis.srem(`call:peers:${callId}`, userId),
+    );
 
     const remainingActive = await this.prisma.callParticipant.count({
       where: { callId, leftAt: null },
@@ -429,7 +446,9 @@ export class CallsService {
         include: { participants: true },
       });
 
-      await this.redis.del(`call:peers:${callId}`);
+      await this.safeRedis('del call peers on endCall', () =>
+        this.redis.del(`call:peers:${callId}`),
+      );
 
       const endPayload = {
         callId,
@@ -451,18 +470,35 @@ export class CallsService {
           endPayload,
         );
       }
+
+      const recipientIds = await this.getOtherCallRecipientIds(call, userId);
+      await Promise.all(
+        recipientIds.map((recipientId) =>
+          this.enqueueCallSignal(callId, recipientId, {
+            ...endPayload,
+            fromUserId: userId,
+            type: 'call_ended',
+          }),
+        ),
+      );
     } else {
-      // Group mesh call continues for remaining participants
-      this.emitToCallRoom(
+      const peerLeftPayload = {
         callId,
-        'call_signal',
-        {
-          callId,
-          fromUserId: userId,
-          type: 'peer_left',
-          leftAt: now.toISOString(),
-        },
-        userId,
+        fromUserId: userId,
+        type: 'peer_left',
+        leftAt: now.toISOString(),
+      };
+
+      // Group mesh call continues for remaining participants
+      this.emitToCallRoom(callId, 'call_signal', peerLeftPayload, userId);
+
+      const activeRecipients = (call.participants ?? [])
+        .filter((p) => p.leftAt === null && p.userId !== userId)
+        .map((p) => p.userId);
+      await Promise.all(
+        activeRecipients.map((recipientId) =>
+          this.enqueueCallSignal(callId, recipientId, peerLeftPayload),
+        ),
       );
     }
 
@@ -512,7 +548,9 @@ export class CallsService {
         },
         include: { participants: true },
       });
-      await this.redis.del(`call:peers:${callId}`);
+      await this.safeRedis('del call peers on rejectCall', () =>
+        this.redis.del(`call:peers:${callId}`),
+      );
     }
 
     const rejectPayload = {
@@ -527,12 +565,26 @@ export class CallsService {
     this.emitToUser(call.callerId, 'call_rejected', rejectPayload);
     this.emitToCallRoom(callId, 'call_rejected', rejectPayload);
 
+    const recipientIds = await this.getOtherCallRecipientIds(call, userId);
+    await Promise.all(
+      recipientIds.map((recipientId) =>
+        this.enqueueCallSignal(callId, recipientId, {
+          ...rejectPayload,
+          fromUserId: userId,
+          type:
+            updatedCall.status === CallStatus.REJECTED
+              ? 'call_rejected'
+              : 'peer_rejected',
+        }),
+      ),
+    );
+
     return updatedCall;
   }
 
   /**
    * Pure WebRTC signaling relay for SDP offers/answers and ICE candidates.
-   * Server never terminates media; it only routes signaling messages in mesh/P2P topology.
+   * Emits over Socket.IO when available AND queues in Redis for HTTP fallback polling.
    */
   async handleSignal(
     callId: string,
@@ -546,9 +598,11 @@ export class CallsService {
       sdp?: unknown;
       candidate?: unknown;
       signal?: unknown;
+      isMuted?: boolean;
+      isVideoOn?: boolean;
     },
   ) {
-    await this.assertCallAccess(callId, fromUserId);
+    const call = await this.assertCallAccess(callId, fromUserId);
 
     const payload = {
       callId,
@@ -569,11 +623,179 @@ export class CallsService {
 
     if (toUserId) {
       this.emitToUser(toUserId, eventName, payload);
+      await this.enqueueCallSignal(callId, toUserId, payload);
     } else {
       this.emitToCallRoom(callId, eventName, payload, fromUserId);
+      const recipientIds = await this.getOtherCallRecipientIds(call, fromUserId);
+      await Promise.all(
+        recipientIds.map((recipientId) =>
+          this.enqueueCallSignal(callId, recipientId, payload),
+        ),
+      );
     }
 
     return { relayed: true, event: eventName, callId };
+  }
+
+  /**
+   * Poll recent incoming ringing calls (within last 90s) for HTTP fallback clients.
+   */
+  async getIncomingCalls(userId: string) {
+    const cutoff = new Date(Date.now() - INCOMING_CALL_WINDOW_MS);
+
+    const calls = await this.prisma.call.findMany({
+      where: {
+        status: { in: [CallStatus.INITIATED, CallStatus.RINGING] },
+        createdAt: { gte: cutoff },
+        callerId: { not: userId },
+        conversation: {
+          members: {
+            some: { userId, isActive: true, leftAt: null },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        caller: {
+          select: {
+            id: true,
+            displayName: true,
+            avatarUrl: true,
+            phoneNumber: true,
+          },
+        },
+        participants: {
+          where: { leftAt: null },
+          include: {
+            user: {
+              select: {
+                id: true,
+                displayName: true,
+                avatarUrl: true,
+              },
+            },
+          },
+        },
+        conversation: {
+          select: {
+            id: true,
+            type: true,
+            group: {
+              select: { id: true, name: true, avatarUrl: true },
+            },
+            _count: {
+              select: {
+                members: { where: { isActive: true, leftAt: null } },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    return calls.map((call) => {
+      const memberCount =
+        call.conversation?._count?.members ?? call.participants?.length ?? 2;
+      return {
+        ...call,
+        ...this.getWebRtcConfig(memberCount),
+      };
+    });
+  }
+
+  /**
+   * Fetch call details, active participants, and WebRTC ICE configuration.
+   */
+  async getCallById(callId: string, userId: string) {
+    await this.assertCallAccess(callId, userId);
+
+    const call = await this.prisma.call.findUnique({
+      where: { id: callId },
+      include: {
+        caller: {
+          select: {
+            id: true,
+            displayName: true,
+            avatarUrl: true,
+            phoneNumber: true,
+          },
+        },
+        participants: {
+          where: { leftAt: null },
+          include: {
+            user: {
+              select: {
+                id: true,
+                displayName: true,
+                avatarUrl: true,
+              },
+            },
+          },
+        },
+        conversation: {
+          select: {
+            id: true,
+            type: true,
+            group: {
+              select: { id: true, name: true, avatarUrl: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!call) {
+      throw new NotFoundException('Call not found');
+    }
+
+    return {
+      ...call,
+      ...this.getWebRtcConfig(call.participants?.length ?? 2),
+    };
+  }
+
+  /**
+   * Push a signaling event into a peer's Redis queue for HTTP fallback consumption.
+   */
+  async enqueueCallSignal(
+    callId: string,
+    targetUserId: string,
+    payload: unknown,
+  ): Promise<void> {
+    if (!targetUserId) {
+      return;
+    }
+
+    const key = `call:signals:${callId}:${targetUserId}`;
+    await this.safeRedis(`enqueueCallSignal ${key}`, async () => {
+      await this.redis.rpush(key, JSON.stringify(payload));
+      await this.redis.expire(key, CALL_SIGNAL_QUEUE_TTL_SECONDS);
+    });
+  }
+
+  /**
+   * Drain and parse queued signaling events for a call participant.
+   */
+  async consumeSignals(callId: string, userId: string) {
+    await this.assertCallAccess(callId, userId);
+
+    const key = `call:signals:${callId}:${userId}`;
+    const rawItems = await this.safeRedis(
+      `consumeSignals ${key}`,
+      () => this.redis.lrangeAndDel(key),
+      [],
+    );
+
+    const signals: unknown[] = [];
+    for (const raw of rawItems) {
+      try {
+        signals.push(JSON.parse(raw));
+      } catch {
+        this.logger.warn(`Skipped malformed call signal JSON in ${key}`);
+      }
+    }
+
+    return { signals };
   }
 
   /**
@@ -767,6 +989,71 @@ export class CallsService {
     }
 
     throw new ForbiddenException('You do not have access to this call');
+  }
+
+  private async getOtherCallRecipientIds(
+    call: {
+      callerId: string;
+      conversationId?: string | null;
+      participants?: Array<{ userId: string; leftAt?: Date | null }>;
+    },
+    excludeUserId: string,
+  ): Promise<string[]> {
+    const targets = new Set<string>();
+
+    if (call.callerId) {
+      targets.add(call.callerId);
+    }
+
+    for (const participant of call.participants ?? []) {
+      if (participant.userId && participant.leftAt == null) {
+        targets.add(participant.userId);
+      }
+    }
+
+    if (
+      call.conversationId &&
+      typeof this.prisma.conversationMember?.findMany === 'function'
+    ) {
+      const members = await this.prisma.conversationMember.findMany({
+        where: {
+          conversationId: call.conversationId,
+          isActive: true,
+          leftAt: null,
+        },
+        select: { userId: true },
+      });
+      for (const member of members ?? []) {
+        targets.add(member.userId);
+      }
+    }
+
+    targets.delete(excludeUserId);
+    return Array.from(targets);
+  }
+
+  private async safeRedis<T>(
+    operation: string,
+    fn: () => Promise<T>,
+  ): Promise<T | undefined>;
+  private async safeRedis<T>(
+    operation: string,
+    fn: () => Promise<T>,
+    fallback: T,
+  ): Promise<T>;
+  private async safeRedis<T>(
+    operation: string,
+    fn: () => Promise<T>,
+    fallback?: T,
+  ): Promise<T | undefined> {
+    try {
+      return await fn();
+    } catch (error) {
+      this.logger.warn(
+        `Non-fatal Redis error (${operation}): ${(error as Error).message}`,
+      );
+      return fallback;
+    }
   }
 
   private emitToUser(userId: string, event: string, data: unknown): void {

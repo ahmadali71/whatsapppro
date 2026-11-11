@@ -63,6 +63,19 @@ describe('Chats, Real-Time Messaging, Gateway & Media Suite', () => {
       return members.length;
     }),
     smembers: jest.fn(async (key: string) => Array.from(redisSets.get(key) ?? [])),
+    rpush: jest.fn(async (key: string, ...vals: string[]) => {
+      const list = redisLists.get(key) ?? [];
+      list.push(...vals);
+      redisLists.set(key, list);
+      return list.length;
+    }),
+    expire: jest.fn(async () => 1),
+    lrangeAndDel: jest.fn(async (key: string) => {
+      const list = redisLists.get(key) ?? [];
+      redisLists.delete(key);
+      redisKeys.delete(key);
+      return list;
+    }),
     getClient: jest.fn(() => mockRedisClient),
   };
 
@@ -479,6 +492,114 @@ describe('Chats, Real-Time Messaging, Gateway & Media Suite', () => {
       expect(presigned).toBe(url);
 
       await expect(mediaService.deleteFile(key)).resolves.toBeUndefined();
+    });
+
+    it('uses inline data-URI fallback without S3 in production/Vercel and rejects > 2.5MB with BadRequestException', async () => {
+      const prodConfig = {
+        get: jest.fn((key: string, defaultValue?: string) => {
+          const map: Record<string, string> = {
+            NODE_ENV: 'production',
+            AWS_S3_REGION: 'us-east-1',
+            AWS_S3_BUCKET: 'test-bucket',
+          };
+          return map[key] ?? defaultValue;
+        }),
+      } as unknown as ConfigService;
+
+      const prodMedia = new MediaService(prodConfig);
+      const smallBytes = Buffer.from('inline-avatar-bytes');
+      const { key, url } = await prodMedia.uploadFileWithKey(
+        smallBytes,
+        'image/png',
+        'avatars',
+      );
+
+      expect(key).toMatch(/^inline:avatars\/.+\.png$/);
+      expect(url).toBe(`data:image/png;base64,${smallBytes.toString('base64')}`);
+      await expect(prodMedia.getPresignedUrl(key)).resolves.toBe(key);
+      await expect(prodMedia.deleteFile(key)).resolves.toBeUndefined();
+
+      const oversized = Buffer.alloc(2_500_001, 1);
+      await expect(
+        prodMedia.uploadFileWithKey(oversized, 'image/png', 'avatars'),
+      ).rejects.toThrow(BadRequestException);
+
+      // Also verify VERCEL=1 triggers inline fallback even if NODE_ENV !== 'production'
+      const prevVercel = process.env.VERCEL;
+      process.env.VERCEL = '1';
+      try {
+        const vercelMedia = new MediaService(mockConfigService as unknown as ConfigService);
+        const vercelResult = await vercelMedia.uploadFileWithKey(
+          smallBytes,
+          'image/webp',
+          'stickers',
+        );
+        expect(vercelResult.url).toBe(
+          `data:image/webp;base64,${smallBytes.toString('base64')}`,
+        );
+      } finally {
+        if (prevVercel === undefined) {
+          delete process.env.VERCEL;
+        } else {
+          process.env.VERCEL = prevVercel;
+        }
+      }
+    });
+  });
+
+  describe('Non-fatal Redis fallback in ChatsService', () => {
+    it('succeeds in getMessages and sendMessage even when Redis throws', async () => {
+      mockRedisService.get.mockRejectedValueOnce(new Error('Stream isn\'t writeable'));
+      mockRedisService.set.mockRejectedValueOnce(new Error('Stream isn\'t writeable'));
+      mockRedisService.del
+        .mockRejectedValueOnce(new Error('Stream isn\'t writeable'))
+        .mockRejectedValueOnce(new Error('Stream isn\'t writeable'));
+      mockRedisService.rpush.mockRejectedValueOnce(new Error('Stream isn\'t writeable'));
+
+      mockPrismaService.conversationMember.findFirst.mockResolvedValue({
+        id: 'cm-1',
+        conversationId: 'conv-1',
+        userId: 'u1',
+        isActive: true,
+        clearedAt: null,
+      });
+      mockPrismaService.message.findMany.mockResolvedValue([
+        {
+          id: 'msg-1',
+          conversationId: 'conv-1',
+          senderId: 'u2',
+          content: 'hello without redis',
+          messageType: MessageType.TEXT,
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          deletedForUsers: [],
+          starredBy: [],
+          isStarred: false,
+        },
+      ]);
+
+      const page = await chatsService.getMessages('conv-1', 'u1', undefined, 20);
+      expect(page.items).toHaveLength(1);
+      expect(page.items[0].content).toBe('hello without redis');
+
+      mockPrismaService.conversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        type: 'DIRECT',
+        members: [{ userId: 'u1' }, { userId: 'u2' }],
+      });
+      mockPrismaService.blockedUser.findFirst.mockResolvedValue(null);
+      mockPrismaService.message.create.mockResolvedValue({
+        id: 'msg-2',
+        conversationId: 'conv-1',
+        senderId: 'u1',
+        content: 'still sends',
+        messageType: MessageType.TEXT,
+      });
+
+      const sent = await chatsService.sendMessage('u1', 'conv-1', {
+        messageType: MessageType.TEXT,
+        content: 'still sends',
+      });
+      expect(sent.id).toBe('msg-2');
     });
   });
 });

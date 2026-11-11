@@ -1,10 +1,11 @@
 import { create } from 'zustand';
 import { Call, CallStatus, CallType, SocketEvents, User } from '@whatsapp-pro/shared-types';
-import { api, unwrapData } from '@/lib/api';
+import { api, extractErrorMessage, unwrapData } from '@/lib/api';
 import { socketManager } from '@/lib/socket';
 import { ConnectionQualityStats, webrtcManager } from '@/lib/webrtc';
 import { callsApi } from '@/services/api.services';
 import { useAuthStore } from './authStore';
+import { toast } from './toastStore';
 
 export interface ActiveCallSession {
   id: string;
@@ -84,6 +85,7 @@ interface CallState {
   toggleScreenShare: () => Promise<void>;
   toggleSpeaker: () => void;
   initCallSocketListeners: () => () => void;
+  initCallHttpPolling: () => () => void;
 }
 
 let durationTimerId: number | null = null;
@@ -102,11 +104,62 @@ interface QueuedIce {
 
 const pendingOffersByCall = new Map<string, QueuedOffer[]>();
 const pendingIceByCall = new Map<string, QueuedIce[]>();
+const dismissedCallIds = new Set<string>();
+const iceServersByCall = new Map<string, RTCIceServer[]>();
+
+interface CallParticipantRecord {
+  userId: string;
+  leftAt?: string | null;
+  user?: User;
+}
+
+interface CallRecordResponse {
+  id: string;
+  callType?: CallType;
+  status?: CallStatus;
+  conversationId?: string | null;
+  callerId?: string;
+  caller?: User;
+  participants?: CallParticipantRecord[];
+  iceServers?: RTCIceServer[];
+}
+
+interface CallSignalRecord {
+  callId: string;
+  fromUserId?: string;
+  toUserId?: string;
+  type?: string;
+  offer?: RTCSessionDescriptionInit;
+  answer?: RTCSessionDescriptionInit;
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+  status?: string;
+}
+
+function mapPeerUsersFromCallRecord(
+  callData: CallRecordResponse,
+  currentUserId?: string,
+): User[] {
+  const map = new Map<string, User>();
+  if (callData.caller && callData.caller.id !== currentUserId) {
+    map.set(callData.caller.id, callData.caller);
+  }
+  if (Array.isArray(callData.participants)) {
+    for (const p of callData.participants) {
+      const u = p?.user;
+      if (u && u.id !== currentUserId && !p.leftAt) {
+        map.set(u.id, u);
+      }
+    }
+  }
+  return Array.from(map.values());
+}
 
 function clearPendingSignals(callId?: string | null) {
   if (!callId) return;
   pendingOffersByCall.delete(callId);
   pendingIceByCall.delete(callId);
+  iceServersByCall.delete(callId);
 }
 
 async function flushPendingSignalsForCall(callId: string) {
@@ -230,13 +283,15 @@ export const useCallStore = create<CallState>((set, get) => ({
         }
       }
 
-      const unwrapped = unwrapData<Call | { call?: Call; callId?: string }>(res.data);
+      const unwrapped = unwrapData<Call & { call?: Call; callId?: string; iceServers?: RTCIceServer[] }>(
+        res.data,
+      );
       const callId = extractCallId(unwrapped);
       if (!isValidCallId(callId)) {
         throw new Error('Server did not return a valid call ID');
       }
 
-      await webrtcManager.initCall(callId, isVideo);
+      await webrtcManager.initCall(callId, isVideo, unwrapped?.iceServers);
       webrtcManager.setHandlers({
         onRemoteStream: (peerId, stream) => {
           set((s) => ({
@@ -295,43 +350,63 @@ export const useCallStore = create<CallState>((set, get) => ({
   acceptIncomingCall: async () => {
     const incoming = get().incomingCall;
     if (!incoming || !isValidCallId(incoming.id)) return;
+    dismissedCallIds.add(incoming.id);
     ringtone.stop();
 
     const isVideo = incoming.callType === CallType.VIDEO;
-    const localStream = await webrtcManager.initCall(incoming.id, isVideo);
+    try {
+      const localStream = await webrtcManager.initCall(
+        incoming.id,
+        isVideo,
+        iceServersByCall.get(incoming.id),
+      );
+      await api.post(`/calls/${incoming.id}/join`);
 
-    webrtcManager.setHandlers({
-      onRemoteStream: (peerId, stream) => {
-        set((s) => ({
-          remoteStreams: { ...s.remoteStreams, [peerId]: stream },
-        }));
-      },
-      onPeerRemoved: (peerId) => {
-        set((s) => {
-          const next = { ...s.remoteStreams };
-          delete next[peerId];
-          return { remoteStreams: next };
-        });
-      },
-      onQualityUpdate: (stats) => set({ connectionQuality: stats }),
-    });
+      webrtcManager.setHandlers({
+        onRemoteStream: (peerId, stream) => {
+          set((s) => ({
+            remoteStreams: { ...s.remoteStreams, [peerId]: stream },
+          }));
+        },
+        onPeerRemoved: (peerId) => {
+          set((s) => {
+            const next = { ...s.remoteStreams };
+            delete next[peerId];
+            return { remoteStreams: next };
+          });
+        },
+        onQualityUpdate: (stats) => set({ connectionQuality: stats }),
+      });
 
-    startDurationTimer((partial) => set(partial));
+      startDurationTimer((partial) => set(partial));
 
-    set({
-      incomingCall: null,
-      activeCall: {
-        ...incoming,
-        status: CallStatus.ONGOING,
-        startedAt: Date.now(),
-      },
-      localStream,
-      isMuted: false,
-      isCameraOff: !isVideo,
-      durationSeconds: 0,
-    });
+      set({
+        incomingCall: null,
+        activeCall: {
+          ...incoming,
+          status: CallStatus.ONGOING,
+          startedAt: Date.now(),
+        },
+        localStream,
+        isMuted: false,
+        isCameraOff: !isVideo,
+        durationSeconds: 0,
+      });
 
-    await flushPendingSignalsForCall(incoming.id);
+      await flushPendingSignalsForCall(incoming.id);
+    } catch (err) {
+      clearPendingSignals(incoming.id);
+      stopDurationTimer();
+      webrtcManager.cleanup();
+      set({
+        incomingCall: null,
+        activeCall: null,
+        localStream: null,
+        remoteStreams: {},
+        durationSeconds: 0,
+      });
+      toast.error(extractErrorMessage(err, 'Failed to join call'));
+    }
   },
 
   rejectIncomingCall: async () => {
@@ -339,6 +414,7 @@ export const useCallStore = create<CallState>((set, get) => ({
     if (!incoming) return;
     ringtone.stop();
     if (isValidCallId(incoming.id)) {
+      dismissedCallIds.add(incoming.id);
       clearPendingSignals(incoming.id);
       try {
         await api.post(`/calls/${incoming.id}/reject`);
@@ -357,6 +433,7 @@ export const useCallStore = create<CallState>((set, get) => ({
     webrtcManager.cleanup();
 
     if (active && isValidCallId(active.id)) {
+      dismissedCallIds.add(active.id);
       clearPendingSignals(active.id);
       try {
         await api.post(`/calls/${active.id}/end`);
@@ -557,11 +634,14 @@ export const useCallStore = create<CallState>((set, get) => ({
       const activeId = get().activeCall?.id;
       const incomingId = get().incomingCall?.id;
       if (endedId) {
+        dismissedCallIds.add(endedId);
         clearPendingSignals(endedId);
         if (endedId !== activeId && endedId !== incomingId) {
           return;
         }
       } else {
+        if (activeId) dismissedCallIds.add(activeId);
+        if (incomingId) dismissedCallIds.add(incomingId);
         clearPendingSignals(activeId);
         clearPendingSignals(incomingId);
       }
@@ -605,5 +685,205 @@ export const useCallStore = create<CallState>((set, get) => ({
     ];
 
     return () => unsubs.forEach((u) => u());
+  },
+
+  initCallHttpPolling: () => {
+    let cancelled = false;
+    let incomingBusy = false;
+    let signalBusy = false;
+    let signalTickCount = 0;
+
+    const closeCallSession = (callId?: string) => {
+      if (callId) {
+        dismissedCallIds.add(callId);
+        clearPendingSignals(callId);
+      }
+      ringtone.stop();
+      stopDurationTimer();
+      webrtcManager.cleanup();
+      set({
+        activeCall: null,
+        incomingCall: null,
+        localStream: null,
+        remoteStreams: {},
+        isMuted: false,
+        isCameraOff: false,
+        isScreenSharing: false,
+        durationSeconds: 0,
+      });
+      void get().fetchCallHistory();
+    };
+
+    const markCallOngoing = () => {
+      ringtone.stop();
+      startDurationTimer((partial) => set(partial));
+      set((s) => ({
+        activeCall: s.activeCall
+          ? {
+              ...s.activeCall,
+              status: CallStatus.ONGOING,
+              startedAt: s.activeCall.startedAt ?? Date.now(),
+            }
+          : null,
+      }));
+    };
+
+    const pollIncoming = async () => {
+      if (cancelled || incomingBusy || socketManager.isConnected || get().activeCall) return;
+      const currentUserId = useAuthStore.getState().user?.id;
+      if (!currentUserId) return;
+
+      incomingBusy = true;
+      try {
+        const res = await api.get('/calls/incoming');
+        if (cancelled || get().activeCall) return;
+        const raw = unwrapData<CallRecordResponse[] | { calls?: CallRecordResponse[] }>(res.data);
+        const list = Array.isArray(raw) ? raw : raw?.calls || [];
+
+        const currentIncoming = get().incomingCall;
+        if (currentIncoming && !list.some((c) => c.id === currentIncoming.id)) {
+          ringtone.stop();
+          set({ incomingCall: null });
+        }
+
+        const nextCall = list.find(
+          (c) =>
+            isValidCallId(c.id) &&
+            !dismissedCallIds.has(c.id) &&
+            c.callerId !== currentUserId &&
+            c.caller?.id !== currentUserId,
+        );
+        if (!nextCall) return;
+
+        if (nextCall.iceServers && nextCall.iceServers.length > 0) {
+          iceServersByCall.set(nextCall.id, nextCall.iceServers);
+        }
+
+        if (get().incomingCall?.id !== nextCall.id) {
+          ringtone.start();
+          set({
+            incomingCall: {
+              id: nextCall.id,
+              callType: nextCall.callType || CallType.AUDIO,
+              conversationId: nextCall.conversationId,
+              status: CallStatus.RINGING,
+              isOutgoing: false,
+              peerUsers: mapPeerUsersFromCallRecord(nextCall, currentUserId),
+            },
+          });
+        }
+      } catch {
+        // Ignore transient polling errors
+      } finally {
+        incomingBusy = false;
+      }
+    };
+
+    const pollActiveCall = async () => {
+      if (cancelled || signalBusy || socketManager.isConnected) return;
+      const currentActive = get().activeCall;
+      const currentUserId = useAuthStore.getState().user?.id;
+      if (!currentActive || !isValidCallId(currentActive.id) || !currentUserId) return;
+
+      const callId = currentActive.id;
+      signalBusy = true;
+      signalTickCount += 1;
+
+      try {
+        const sigRes = await api.get(`/calls/${callId}/signals`);
+        if (cancelled || get().activeCall?.id !== callId) return;
+        const sigData = unwrapData<{ signals?: CallSignalRecord[] } | CallSignalRecord[]>(
+          sigRes.data,
+        );
+        const signals = Array.isArray(sigData) ? sigData : sigData?.signals || [];
+
+        for (const sig of signals) {
+          if (cancelled || get().activeCall?.id !== callId) return;
+          if (sig.fromUserId && sig.fromUserId === currentUserId) continue;
+
+          if (sig.type === 'call_ended' || sig.type === 'call_rejected') {
+            closeCallSession(callId);
+            return;
+          }
+
+          if (sig.type === 'peer_joined' && sig.fromUserId) {
+            markCallOngoing();
+            if (!webrtcManager.hasPeerConnection(sig.fromUserId)) {
+              await webrtcManager.createOfferForPeer(sig.fromUserId, callId);
+            }
+          } else if (sig.type === 'peer_left' && sig.fromUserId) {
+            webrtcManager.removePeer(sig.fromUserId);
+          } else if (sig.type === 'offer' && sig.fromUserId && (sig.offer || sig.sdp)) {
+            markCallOngoing();
+            await webrtcManager.handleOffer(sig.fromUserId, callId, (sig.offer || sig.sdp)!);
+          } else if (sig.type === 'answer' && sig.fromUserId && (sig.answer || sig.sdp)) {
+            markCallOngoing();
+            await webrtcManager.handleAnswer(sig.fromUserId, (sig.answer || sig.sdp)!);
+          } else if (
+            (sig.type === 'ice-candidate' || sig.type === 'ice_candidate') &&
+            sig.fromUserId &&
+            sig.candidate
+          ) {
+            await webrtcManager.handleIceCandidate(sig.fromUserId, sig.candidate);
+          }
+        }
+
+        if (signalTickCount % 2 === 0 && !cancelled && get().activeCall?.id === callId) {
+          const callRes = await api.get(`/calls/${callId}`);
+          if (cancelled || get().activeCall?.id !== callId) return;
+          const details = unwrapData<CallRecordResponse>(callRes.data);
+          if (!details) return;
+
+          if (
+            details.status === CallStatus.ENDED ||
+            details.status === CallStatus.REJECTED ||
+            details.status === CallStatus.MISSED
+          ) {
+            closeCallSession(callId);
+            return;
+          }
+
+          if (details.status === CallStatus.ONGOING) {
+            const latestActive = get().activeCall;
+            const wasRinging = latestActive?.status === CallStatus.RINGING;
+            markCallOngoing();
+
+            if (
+              (wasRinging || latestActive?.isOutgoing) &&
+              Array.isArray(details.participants)
+            ) {
+              for (const p of details.participants) {
+                if (
+                  p.userId &&
+                  p.userId !== currentUserId &&
+                  !p.leftAt &&
+                  !webrtcManager.hasPeerConnection(p.userId)
+                ) {
+                  await webrtcManager.createOfferForPeer(p.userId, callId);
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // Ignore transient polling errors
+      } finally {
+        signalBusy = false;
+      }
+    };
+
+    void pollIncoming();
+    const incomingTimer = window.setInterval(() => {
+      void pollIncoming();
+    }, 2500);
+    const activeTimer = window.setInterval(() => {
+      void pollActiveCall();
+    }, 800);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(incomingTimer);
+      window.clearInterval(activeTimer);
+    };
   },
 }));

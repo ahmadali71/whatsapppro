@@ -5,6 +5,7 @@ import {
   BadRequestException,
   Inject,
   forwardRef,
+  Logger,
 } from '@nestjs/common';
 import { Prisma, ReceiptStatus, MessageType } from '@prisma/client';
 import * as dns from 'dns/promises';
@@ -49,6 +50,8 @@ const MESSAGE_INCLUDE = {
 
 @Injectable()
 export class ChatsService {
+  private readonly logger = new Logger(ChatsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
@@ -223,10 +226,14 @@ export class ChatsService {
     });
 
     if (existing) {
-      await this.gatewayService.ensureSocketsJoinConversation(
-        [userId, otherUserId],
-        existing.id,
-      );
+      try {
+        await this.gatewayService.ensureSocketsJoinConversation(
+          [userId, otherUserId],
+          existing.id,
+        );
+      } catch (error) {
+        this.logger.warn(`Non-fatal socket join error: ${(error as Error).message}`);
+      }
       return existing;
     }
 
@@ -259,12 +266,16 @@ export class ChatsService {
       },
     });
 
-    await this.gatewayService.ensureSocketsJoinConversation(
-      [userId, otherUserId],
-      created.id,
-    );
-    this.gatewayService.emitToUser(userId, 'conversation_created', created);
-    this.gatewayService.emitToUser(otherUserId, 'conversation_created', created);
+    try {
+      await this.gatewayService.ensureSocketsJoinConversation(
+        [userId, otherUserId],
+        created.id,
+      );
+      this.gatewayService.emitToUser(userId, 'conversation_created', created);
+      this.gatewayService.emitToUser(otherUserId, 'conversation_created', created);
+    } catch (error) {
+      this.logger.warn(`Non-fatal socket notify error: ${(error as Error).message}`);
+    }
 
     return created;
   }
@@ -348,10 +359,18 @@ export class ChatsService {
     await this.assertMember(conversationId, userId);
     const take = Math.min(limit, 100);
 
-    const [deletedForMeIds, pinnedIds] = await Promise.all([
-      this.redis.smembers(`deleted_for_me:${userId}`),
-      this.redis.smembers(`pinned:${conversationId}`),
-    ]);
+    let deletedForMeIds: string[] = [];
+    let pinnedIds: string[] = [];
+    try {
+      [deletedForMeIds, pinnedIds] = await Promise.all([
+        this.redis.smembers(`deleted_for_me:${userId}`),
+        this.redis.smembers(`pinned:${conversationId}`),
+      ]);
+    } catch (error) {
+      this.logger.warn(
+        `Non-fatal Redis read failure in getMessages(${conversationId}): ${(error as Error).message}`,
+      );
+    }
     const pinnedSet = new Set(pinnedIds);
 
     const messages = await this.prisma.message.findMany({
@@ -505,24 +524,32 @@ export class ChatsService {
       }
 
       return created;
-    });
+    }, { maxWait: 10000, timeout: 15000 });
 
-    // Clear typing state for sender
-    await this.gatewayService.setTyping(conversationId, userId, false);
+    // Clear typing state, join rooms, broadcast & queue offline recipients (non-fatal if Redis/socket unavailable)
+    try {
+      await this.gatewayService.setTyping(conversationId, userId, false);
+    } catch (error) {
+      this.logger.warn(`Non-fatal setTyping failure: ${(error as Error).message}`);
+    }
 
-    // Ensure all active members' connected sockets have joined the conversation room
-    const memberIds = conversation.members.map((m) => m.userId);
-    await this.gatewayService.ensureSocketsJoinConversation(memberIds, conversationId);
+    try {
+      const memberIds = conversation.members.map((m) => m.userId);
+      await this.gatewayService.ensureSocketsJoinConversation(memberIds, conversationId);
+      this.gatewayService.broadcastToConversation(conversationId, 'new_message', message);
+    } catch (error) {
+      this.logger.warn(`Non-fatal gateway broadcast failure: ${(error as Error).message}`);
+    }
 
-    // Broadcast real-time event to conversation room
-    this.gatewayService.broadcastToConversation(conversationId, 'new_message', message);
-
-    // Queue offline messages for any member currently disconnected
-    await this.queueOfflineRecipients(
-      conversation.members.map((m) => m.userId).filter((id) => id !== userId),
-      conversationId,
-      message,
-    );
+    try {
+      await this.queueOfflineRecipients(
+        conversation.members.map((m) => m.userId).filter((id) => id !== userId),
+        conversationId,
+        message,
+      );
+    } catch (error) {
+      this.logger.warn(`Non-fatal offline queue failure: ${(error as Error).message}`);
+    }
 
     return message;
   }
@@ -534,14 +561,20 @@ export class ChatsService {
   ): Promise<void> {
     await Promise.all(
       recipientIds.map(async (recipientId) => {
-        const online = await this.gatewayService.isUserOnline(recipientId);
-        if (!online) {
-          await this.gatewayService.queueOfflineEvent(
-            recipientId,
-            'new_message',
-            message,
-            conversationId,
-            message.id,
+        try {
+          const online = await this.gatewayService.isUserOnline(recipientId);
+          if (!online) {
+            await this.gatewayService.queueOfflineEvent(
+              recipientId,
+              'new_message',
+              message,
+              conversationId,
+              message.id,
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            `Non-fatal offline queue error for ${recipientId}: ${(error as Error).message}`,
           );
         }
       }),
@@ -616,7 +649,13 @@ export class ChatsService {
     }
 
     // Delete for current user only (stored per-user in Redis)
-    await this.redis.sadd(`deleted_for_me:${userId}`, messageId);
+    try {
+      await this.redis.sadd(`deleted_for_me:${userId}`, messageId);
+    } catch (error) {
+      this.logger.warn(
+        `Non-fatal Redis sadd failure in deleteMessage(${messageId}): ${(error as Error).message}`,
+      );
+    }
     return {
       messageId,
       conversationId: msg.conversationId,
@@ -835,22 +874,34 @@ export class ChatsService {
       })) ?? [];
     const targetMemberIds = targetMembers.map((m) => m.userId);
     if (targetMemberIds.length > 0) {
-      await this.gatewayService.ensureSocketsJoinConversation(
-        targetMemberIds,
-        toConversationId,
-      );
-      await this.queueOfflineRecipients(
-        targetMemberIds.filter((id) => id !== userId),
-        toConversationId,
-        forwarded,
-      );
+      try {
+        await this.gatewayService.ensureSocketsJoinConversation(
+          targetMemberIds,
+          toConversationId,
+        );
+      } catch (error) {
+        this.logger.warn(`Non-fatal socket join in forwardMessage: ${(error as Error).message}`);
+      }
+      try {
+        await this.queueOfflineRecipients(
+          targetMemberIds.filter((id) => id !== userId),
+          toConversationId,
+          forwarded,
+        );
+      } catch (error) {
+        this.logger.warn(`Non-fatal offline queue in forwardMessage: ${(error as Error).message}`);
+      }
     }
 
-    this.gatewayService.broadcastToConversation(
-      toConversationId,
-      'new_message',
-      forwarded,
-    );
+    try {
+      this.gatewayService.broadcastToConversation(
+        toConversationId,
+        'new_message',
+        forwarded,
+      );
+    } catch (error) {
+      this.logger.warn(`Non-fatal broadcast in forwardMessage: ${(error as Error).message}`);
+    }
 
     return forwarded;
   }
@@ -967,12 +1018,16 @@ export class ChatsService {
     await this.assertMember(msg.conversationId, userId);
 
     const pinnedAt = new Date().toISOString();
-    await this.redis.sadd(`pinned:${msg.conversationId}`, messageId);
-    await this.redis.hset(
-      `pinned_meta:${msg.conversationId}`,
-      messageId,
-      JSON.stringify({ messageId, pinnedBy: userId, pinnedAt }),
-    );
+    try {
+      await this.redis.sadd(`pinned:${msg.conversationId}`, messageId);
+      await this.redis.hset(
+        `pinned_meta:${msg.conversationId}`,
+        messageId,
+        JSON.stringify({ messageId, pinnedBy: userId, pinnedAt }),
+      );
+    } catch (error) {
+      this.logger.warn(`Non-fatal Redis pin failure: ${(error as Error).message}`);
+    }
 
     const payload = {
       conversationId: msg.conversationId,
@@ -982,11 +1037,15 @@ export class ChatsService {
       pinned: true,
     };
 
-    this.gatewayService.broadcastToConversation(
-      msg.conversationId,
-      'message_pinned',
-      payload,
-    );
+    try {
+      this.gatewayService.broadcastToConversation(
+        msg.conversationId,
+        'message_pinned',
+        payload,
+      );
+    } catch (error) {
+      this.logger.warn(`Non-fatal broadcast pin failure: ${(error as Error).message}`);
+    }
 
     return payload;
   }
@@ -995,8 +1054,12 @@ export class ChatsService {
     const msg = await this.findMessageOrFail(messageId);
     await this.assertMember(msg.conversationId, userId);
 
-    await this.redis.srem(`pinned:${msg.conversationId}`, messageId);
-    await this.redis.hdel(`pinned_meta:${msg.conversationId}`, messageId);
+    try {
+      await this.redis.srem(`pinned:${msg.conversationId}`, messageId);
+      await this.redis.hdel(`pinned_meta:${msg.conversationId}`, messageId);
+    } catch (error) {
+      this.logger.warn(`Non-fatal Redis unpin failure: ${(error as Error).message}`);
+    }
 
     const payload = {
       conversationId: msg.conversationId,
@@ -1005,11 +1068,15 @@ export class ChatsService {
       pinned: false,
     };
 
-    this.gatewayService.broadcastToConversation(
-      msg.conversationId,
-      'message_unpinned',
-      payload,
-    );
+    try {
+      this.gatewayService.broadcastToConversation(
+        msg.conversationId,
+        'message_unpinned',
+        payload,
+      );
+    } catch (error) {
+      this.logger.warn(`Non-fatal broadcast unpin failure: ${(error as Error).message}`);
+    }
 
     return payload;
   }
@@ -1017,13 +1084,23 @@ export class ChatsService {
   async getPinnedMessages(conversationId: string, userId: string) {
     await this.assertMember(conversationId, userId);
 
-    const pinnedIds = await this.redis.smembers(`pinned:${conversationId}`);
-    if (pinnedIds.length === 0) {
+    let pinnedIds: string[] = [];
+    let metaMap: Record<string, string> = {};
+    try {
+      pinnedIds = await this.redis.smembers(`pinned:${conversationId}`);
+      if (pinnedIds.length === 0) {
+        return [];
+      }
+      const client = this.redis.getClient();
+      metaMap = await client.hgetall(`pinned_meta:${conversationId}`);
+    } catch (error) {
+      this.logger.warn(`Non-fatal Redis getPinnedMessages failure: ${(error as Error).message}`);
       return [];
     }
 
-    const client = this.redis.getClient();
-    const metaMap = await client.hgetall(`pinned_meta:${conversationId}`);
+    if (pinnedIds.length === 0) {
+      return [];
+    }
 
     const messages = await this.prisma.message.findMany({
       where: {
@@ -1097,66 +1174,85 @@ export class ChatsService {
       throw new BadRequestException('Invalid poll option');
     }
 
-    // Atomically track voter per option in Redis and sync into message content
-    const client = this.redis.getClient();
+    // Atomically track voter per option in Redis (non-fatal fallback to DB JSON if Redis unavailable)
     const voterKeyPrefix = `poll_voters:${messageId}`;
+    try {
+      const client = this.redis.getClient();
+      const alreadyVotedSet = await client.sismember(
+        `${voterKeyPrefix}:${targetIndex}`,
+        userId,
+      );
 
-    // Check if options use array-of-userIds (web) or numeric tally (mobile)
-    const targetOption = pollData.options[targetIndex];
-    const alreadyVotedSet = await client.sismember(
-      `${voterKeyPrefix}:${targetIndex}`,
-      userId,
-    );
+      if (!pollData.allowMultiple) {
+        await Promise.all(
+          pollData.options.map(async (opt, idx) => {
+            if (idx !== targetIndex) {
+              await client.srem(`${voterKeyPrefix}:${idx}`, userId);
+              if (Array.isArray(opt.votes)) {
+                opt.votes = opt.votes.filter((id) => id !== userId);
+              }
+            }
+          }),
+        );
+      }
 
-    if (!pollData.allowMultiple) {
-      // Remove previous vote from other options if single-choice
+      if (alreadyVotedSet === 1) {
+        await client.srem(`${voterKeyPrefix}:${targetIndex}`, userId);
+      } else {
+        await client.sadd(`${voterKeyPrefix}:${targetIndex}`, userId);
+      }
+
       await Promise.all(
         pollData.options.map(async (opt, idx) => {
-          if (idx !== targetIndex) {
-            await client.srem(`${voterKeyPrefix}:${idx}`, userId);
-            if (Array.isArray(opt.votes)) {
-              opt.votes = opt.votes.filter((id) => id !== userId);
+          const voters = await client.smembers(`${voterKeyPrefix}:${idx}`);
+          if (typeof opt.votes === 'number') {
+            opt.votes = voters.length;
+          } else {
+            const merged = new Set(Array.isArray(opt.votes) ? opt.votes : []);
+            if (idx === targetIndex) {
+              if (alreadyVotedSet === 1) {
+                merged.delete(userId);
+              } else {
+                merged.add(userId);
+              }
+            } else if (!pollData.allowMultiple) {
+              merged.delete(userId);
             }
+            for (const v of voters) {
+              merged.add(v);
+            }
+            opt.votes = Array.from(merged);
           }
+          await this.redis.hset(
+            `poll_votes:${messageId}`,
+            String(idx),
+            String(Array.isArray(opt.votes) ? opt.votes.length : opt.votes ?? 0),
+          );
         }),
       );
-    }
-
-    if (alreadyVotedSet === 1) {
-      await client.srem(`${voterKeyPrefix}:${targetIndex}`, userId);
-    } else {
-      await client.sadd(`${voterKeyPrefix}:${targetIndex}`, userId);
-    }
-
-    // Recompute votes per option from Redis sets + existing array values
-    await Promise.all(
-      pollData.options.map(async (opt, idx) => {
-        const voters = await client.smembers(`${voterKeyPrefix}:${idx}`);
-        if (typeof opt.votes === 'number') {
-          opt.votes = voters.length;
-        } else {
-          const merged = new Set(Array.isArray(opt.votes) ? opt.votes : []);
-          if (idx === targetIndex) {
-            if (alreadyVotedSet === 1) {
-              merged.delete(userId);
-            } else {
-              merged.add(userId);
-            }
-          } else if (!pollData.allowMultiple) {
-            merged.delete(userId);
+    } catch (error) {
+      this.logger.warn(
+        `Non-fatal Redis poll sync failure for ${messageId}; updating JSON directly: ${(error as Error).message}`,
+      );
+      const targetOpt = pollData.options[targetIndex];
+      const existingVotes = Array.isArray(targetOpt.votes) ? targetOpt.votes : [];
+      const alreadyVoted = existingVotes.includes(userId);
+      if (!pollData.allowMultiple) {
+        pollData.options.forEach((opt, idx) => {
+          if (idx !== targetIndex && Array.isArray(opt.votes)) {
+            opt.votes = opt.votes.filter((id) => id !== userId);
           }
-          for (const v of voters) {
-            merged.add(v);
-          }
-          opt.votes = Array.from(merged);
-        }
-        await this.redis.hset(
-          `poll_votes:${messageId}`,
-          String(idx),
-          String(Array.isArray(opt.votes) ? opt.votes.length : opt.votes ?? 0),
-        );
-      }),
-    );
+        });
+      }
+      if (typeof targetOpt.votes === 'number') {
+        targetOpt.votes = Math.max(0, targetOpt.votes + 1);
+      } else {
+        const set = new Set(existingVotes);
+        if (alreadyVoted) set.delete(userId);
+        else set.add(userId);
+        targetOpt.votes = Array.from(set);
+      }
+    }
 
     const updated = await this.prisma.message.update({
       where: { id: messageId },
@@ -1167,11 +1263,15 @@ export class ChatsService {
       include: MESSAGE_INCLUDE,
     });
 
-    this.gatewayService.broadcastToConversation(
-      msg.conversationId,
-      'message_updated',
-      updated,
-    );
+    try {
+      this.gatewayService.broadcastToConversation(
+        msg.conversationId,
+        'message_updated',
+        updated,
+      );
+    } catch (error) {
+      this.logger.warn(`Non-fatal poll broadcast failure: ${(error as Error).message}`);
+    }
 
     return updated;
   }
@@ -1259,13 +1359,13 @@ export class ChatsService {
     await this.assertSafePublicHost(parsed.hostname);
 
     const cacheKey = `link_preview:${parsed.toString()}`;
-    const cached = await this.redis.get(cacheKey);
-    if (cached) {
-      try {
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
         return JSON.parse(cached) as Record<string, unknown>;
-      } catch {
-        // Ignore stale cache
       }
+    } catch {
+      // Ignore cache read/parse errors
     }
 
     const controller = new AbortController();
@@ -1333,7 +1433,11 @@ export class ChatsService {
         siteName,
       };
 
-      await this.redis.set(cacheKey, JSON.stringify(preview), 3600);
+      try {
+        await this.redis.set(cacheKey, JSON.stringify(preview), 3600);
+      } catch {
+        // Non-fatal cache write error
+      }
       return preview;
     } catch (error) {
       if ((error as Error).name === 'AbortError') {

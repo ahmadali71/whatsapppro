@@ -102,6 +102,12 @@ export class MediaService {
    * Upload a file buffer to S3 (or local disk in non-production dev when S3 is unconfigured)
    * under `folder/{uuid}.{ext}` and return its URL.
    */
+  private readonly MAX_INLINE_FALLBACK_BYTES = 2_500_000;
+
+  private isServerlessOrProduction(): boolean {
+    return this.isProduction || Boolean(process.env.VERCEL);
+  }
+
   async uploadFile(
     buffer: Buffer,
     mimeType: string,
@@ -113,10 +119,13 @@ export class MediaService {
     const key = `${cleanFolder}/${filename}`;
 
     if (!this.isS3Configured) {
-      if (this.isProduction) {
-        throw new InternalServerErrorException(
-          'AWS S3 credentials are required in production',
-        );
+      if (this.isServerlessOrProduction()) {
+        if (buffer.length > this.MAX_INLINE_FALLBACK_BYTES) {
+          throw new BadRequestException(
+            'Media uploads above 2.5 MB require S3 storage configuration',
+          );
+        }
+        return `data:${mimeType};base64,${buffer.toString('base64')}`;
       }
 
       const targetDir = path.resolve(this.localUploadsRoot, cleanFolder);
@@ -150,7 +159,9 @@ export class MediaService {
     folder = 'uploads',
   ): Promise<{ key: string; url: string }> {
     const url = await this.uploadFile(buffer, mimeType, folder);
-    const key = this.extractKeyFromUrl(url);
+    const key = url.startsWith('data:')
+      ? `inline:${this.sanitizeFolder(folder)}/${uuidv4()}.${this.extensionFromMimeType(mimeType)}`
+      : this.extractKeyFromUrl(url);
     return { key, url };
   }
 
@@ -162,7 +173,16 @@ export class MediaService {
       throw new BadRequestException('S3 object key is required');
     }
 
-    if (!this.isS3Configured && !this.isProduction) {
+    if (key.startsWith('data:') || key.startsWith('inline:')) {
+      return key;
+    }
+
+    if (!this.isS3Configured) {
+      if (this.isServerlessOrProduction()) {
+        throw new BadRequestException(
+          'Presigned URLs require S3 storage configuration',
+        );
+      }
       const cleanKey = key.replace(/^\/+/, '').replace(/^uploads\//, '');
       return `/uploads/${cleanKey}`;
     }
@@ -183,7 +203,14 @@ export class MediaService {
       throw new BadRequestException('S3 object key is required');
     }
 
-    if (!this.isS3Configured && !this.isProduction) {
+    if (key.startsWith('data:') || key.startsWith('inline:')) {
+      return;
+    }
+
+    if (!this.isS3Configured) {
+      if (this.isServerlessOrProduction()) {
+        return;
+      }
       const cleanKey = key.replace(/^\/+/, '').replace(/^uploads\//, '');
       const targetPath = path.resolve(this.localUploadsRoot, cleanKey);
       if (!targetPath.startsWith(this.localUploadsRoot + path.sep)) {
@@ -308,6 +335,9 @@ export class MediaService {
   }
 
   private extractKeyFromUrl(url: string): string {
+    if (url.startsWith('data:')) {
+      return url;
+    }
     if (url.startsWith('/uploads/')) {
       return url.slice('/uploads/'.length);
     }

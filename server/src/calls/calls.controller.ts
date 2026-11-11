@@ -19,6 +19,7 @@ import {
 } from '@nestjs/swagger';
 import { CallsService } from './calls.service';
 import { InitiateCallDto } from './dto/initiate-call.dto';
+import { CallSignalDto } from './dto/call-signal.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 
@@ -56,6 +57,13 @@ export class CallsController {
     return this.callsService.getActiveCall(userId);
   }
 
+  @Get('incoming')
+  @ApiOperation({ summary: 'Poll recent incoming ringing calls for current user' })
+  @ApiResponse({ status: 200, description: 'List of recent incoming ringing calls' })
+  async getIncomingCalls(@CurrentUser('id') userId: string) {
+    return this.callsService.getIncomingCalls(userId);
+  }
+
   @Post()
   @ApiOperation({ summary: 'Initiate an audio or video WebRTC call' })
   @ApiResponse({ status: 201, description: 'Call initiated and members notified' })
@@ -70,6 +78,16 @@ export class CallsController {
     );
   }
 
+  @Get(':id')
+  @ApiOperation({ summary: 'Get call details, active participants, and ICE config' })
+  @ApiResponse({ status: 200, description: 'Call details' })
+  async getCallById(
+    @CurrentUser('id') userId: string,
+    @Param('id', ParseUUIDPipe) callId: string,
+  ) {
+    return this.callsService.getCallById(callId, userId);
+  }
+
   @Post(':id/join')
   @ApiOperation({ summary: 'Join an active call and retrieve mesh peers' })
   @ApiResponse({ status: 200, description: 'Joined call successfully' })
@@ -78,6 +96,27 @@ export class CallsController {
     @Param('id', ParseUUIDPipe) callId: string,
   ) {
     return this.callsService.joinCall(callId, userId);
+  }
+
+  @Post(':id/signal')
+  @ApiOperation({ summary: 'Relay a WebRTC signaling message (HTTP fallback / Socket.IO)' })
+  @ApiResponse({ status: 201, description: 'Signal relayed and queued' })
+  async sendSignal(
+    @CurrentUser('id') userId: string,
+    @Param('id', ParseUUIDPipe) callId: string,
+    @Body() dto: CallSignalDto,
+  ) {
+    return this.callsService.handleSignal(callId, userId, dto.toUserId, dto);
+  }
+
+  @Get(':id/signals')
+  @ApiOperation({ summary: 'Drain queued WebRTC signaling messages for current user' })
+  @ApiResponse({ status: 200, description: 'Queued WebRTC signals' })
+  async consumeSignals(
+    @CurrentUser('id') userId: string,
+    @Param('id', ParseUUIDPipe) callId: string,
+  ) {
+    return this.callsService.consumeSignals(callId, userId);
   }
 
   @Post(':id/end')

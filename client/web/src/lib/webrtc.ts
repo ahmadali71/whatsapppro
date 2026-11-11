@@ -83,14 +83,75 @@ class WebRTCManager {
     this.stopScreenShare();
   }
 
-  hasPeer(peerUserId: string): boolean {
-    return this.peers.has(peerUserId);
+  hasPeerConnection(peerUserId: string): boolean {
+    const pc = this.peers.get(peerUserId);
+    return Boolean(pc && pc.connectionState !== 'closed' && pc.connectionState !== 'failed');
   }
 
-  async initCall(callId: string, video: boolean): Promise<MediaStream> {
-    await this.fetchIceServers();
+  hasPeer(peerUserId: string): boolean {
+    return this.hasPeerConnection(peerUserId);
+  }
+
+  private sendSignal(
+    callId: string,
+    toUserId: string,
+    data: {
+      type: 'offer' | 'answer' | 'ice-candidate';
+      sdp?: RTCSessionDescriptionInit;
+      offer?: RTCSessionDescriptionInit;
+      answer?: RTCSessionDescriptionInit;
+      candidate?: RTCIceCandidateInit;
+    },
+  ) {
+    if (socketManager.isConnected) {
+      if (data.type === 'offer') {
+        socketManager.emit('call_offer', {
+          callId,
+          toUserId,
+          sdp: data.sdp || data.offer,
+          offer: data.offer || data.sdp,
+        });
+      } else if (data.type === 'answer') {
+        socketManager.emit('call_answer', {
+          callId,
+          toUserId,
+          sdp: data.sdp || data.answer,
+          answer: data.answer || data.sdp,
+        });
+      } else if (data.type === 'ice-candidate' && data.candidate) {
+        socketManager.emit('ice_candidate', {
+          callId,
+          toUserId,
+          candidate: data.candidate,
+        });
+      }
+      return;
+    }
+
+    void api
+      .post(`/calls/${callId}/signal`, {
+        toUserId,
+        ...data,
+      })
+      .catch((err) => {
+        console.warn('[WebRTC] HTTP signal delivery failed:', err);
+      });
+  }
+
+  async initCall(
+    callId: string,
+    video: boolean,
+    iceServersOverride?: RTCIceServer[],
+  ): Promise<MediaStream> {
+    if (iceServersOverride && iceServersOverride.length > 0) {
+      this.iceServers = iceServersOverride;
+    } else {
+      await this.fetchIceServers();
+    }
     const stream = await this.startLocalMedia(video);
-    socketManager.emit('call_join', { callId });
+    if (socketManager.isConnected) {
+      socketManager.emit('call_join', { callId });
+    }
     this.startStatsMonitoring();
     return stream;
   }
@@ -111,9 +172,8 @@ class WebRTCManager {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socketManager.emit('ice_candidate', {
-          callId,
-          toUserId: peerUserId,
+        this.sendSignal(callId, peerUserId, {
+          type: 'ice-candidate',
           candidate: event.candidate.toJSON(),
         });
       }
@@ -141,9 +201,8 @@ class WebRTCManager {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    socketManager.emit('call_offer', {
-      callId,
-      toUserId: peerUserId,
+    this.sendSignal(callId, peerUserId, {
+      type: 'offer',
       sdp: offer,
       offer,
     });
@@ -180,9 +239,8 @@ class WebRTCManager {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
-    socketManager.emit('call_answer', {
-      callId,
-      toUserId: peerUserId,
+    this.sendSignal(callId, peerUserId, {
+      type: 'answer',
       sdp: answer,
       answer,
     });

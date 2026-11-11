@@ -12,6 +12,17 @@ interface QueuedAction {
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || API_ORIGIN;
 
+function isServerlessSocketDisabled(): boolean {
+  if (import.meta.env.VITE_FORCE_SOCKET === 'true') return false;
+  try {
+    const baseOrigin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost';
+    const host = new URL(SOCKET_URL, baseOrigin).hostname.toLowerCase();
+    return host.endsWith('.vercel.app');
+  } catch {
+    return SOCKET_URL.toLowerCase().includes('.vercel.app');
+  }
+}
+
 class SocketManager {
   private socket: Socket | null = null;
   private offlineQueue: QueuedAction[] = [];
@@ -30,8 +41,21 @@ class SocketManager {
     return this._httpFallback;
   }
 
-  connect(tokenOverride?: string): Socket {
+  connect(tokenOverride?: string): Socket | null {
     const token = tokenOverride || getStoredTokens().accessToken;
+    if (isServerlessSocketDisabled()) {
+      if (this.socket) {
+        this.socket.disconnect();
+        this.socket = null;
+      }
+      this.consecutiveFailures = 0;
+      this._isConnected = false;
+      this._httpFallback = true;
+      this.notifyConnectionState(false);
+      this.notifyFallbackState(true);
+      return null;
+    }
+
     if (this.socket?.connected) {
       return this.socket;
     }
@@ -112,7 +136,7 @@ class SocketManager {
       this.socket.emit(event, payload);
       return true;
     }
-    if (queueIfOffline) {
+    if (queueIfOffline && !this._httpFallback) {
       this.offlineQueue.push({ event, payload, queuedAt: Date.now() });
     }
     return false;

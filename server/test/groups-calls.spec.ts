@@ -54,6 +54,7 @@ describe('Groups & WebRTC Calls Suite', () => {
     conversationMember: {
       createMany: jest.fn(),
       findFirst: jest.fn(),
+      findMany: jest.fn(async () => []),
       count: jest.fn(),
       upsert: jest.fn(),
       updateMany: jest.fn(),
@@ -85,6 +86,8 @@ describe('Groups & WebRTC Calls Suite', () => {
     srem: jest.fn(async () => 1),
     expire: jest.fn(async () => 1),
     del: jest.fn(async () => 1),
+    rpush: jest.fn(async (_key: string, ..._values: string[]) => 1),
+    lrangeAndDel: jest.fn(async (_key: string): Promise<string[]> => []),
   };
 
   const mockNotificationsService = {
@@ -541,6 +544,145 @@ describe('Groups & WebRTC Calls Suite', () => {
       expect(ended.durationSeconds).toBeGreaterThanOrEqual(9);
       expect((callsService.getServer() as any).emitted).toContainEqual(
         expect.objectContaining({ room: 'call:call-2', event: 'call_ended' }),
+      );
+    });
+
+    it('returns recent incoming ringing calls and call details with ICE config', async () => {
+      mockPrismaService.call.findMany.mockResolvedValueOnce([
+        {
+          id: 'call-in-1',
+          callerId: 'u1',
+          conversationId: 'conv-1',
+          callType: CallType.VIDEO,
+          status: CallStatus.RINGING,
+          caller: { id: 'u1', displayName: 'Alice' },
+          participants: [{ userId: 'u1', user: { id: 'u1', displayName: 'Alice' } }],
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            group: null,
+            _count: { members: 2 },
+          },
+        },
+      ]);
+
+      const incoming = await callsController.getIncomingCalls('u2');
+      expect(incoming).toHaveLength(1);
+      expect(incoming[0].id).toBe('call-in-1');
+      expect(incoming[0].hasTurn).toBe(true);
+      expect(incoming[0].iceServers.length).toBeGreaterThanOrEqual(3);
+
+      mockPrismaService.call.findUnique
+        .mockResolvedValueOnce({
+          id: 'call-in-1',
+          callerId: 'u1',
+          conversationId: 'conv-1',
+          participants: [{ userId: 'u1' }, { userId: 'u2' }],
+        })
+        .mockResolvedValueOnce({
+          id: 'call-in-1',
+          callerId: 'u1',
+          conversationId: 'conv-1',
+          status: CallStatus.RINGING,
+          caller: { id: 'u1', displayName: 'Alice' },
+          participants: [{ userId: 'u1', leftAt: null, user: { id: 'u1', displayName: 'Alice' } }],
+          conversation: { id: 'conv-1', type: 'DIRECT', group: null },
+        });
+
+      const details = await callsController.getCallById('u2', 'call-in-1');
+      expect(details.id).toBe('call-in-1');
+      expect(details.hasTurn).toBe(true);
+    });
+
+    it('queues and drains WebRTC signals in Redis for HTTP fallback and survives Redis failure', async () => {
+      mockPrismaService.call.findUnique.mockResolvedValue({
+        id: 'call-http-1',
+        callerId: 'u1',
+        conversationId: 'conv-1',
+        participants: [
+          { userId: 'u1', leftAt: null },
+          { userId: 'u2', leftAt: null },
+        ],
+      });
+
+      const queuedPayloads: string[] = [];
+      mockRedisService.rpush.mockImplementationOnce(async (_key: string, val: string) => {
+        queuedPayloads.push(val);
+        return queuedPayloads.length;
+      });
+      mockRedisService.lrangeAndDel.mockImplementationOnce(async () => [...queuedPayloads]);
+
+      await callsController.sendSignal('u1', 'call-http-1', {
+        toUserId: 'u2',
+        type: 'offer',
+        sdp: { type: 'offer', sdp: 'v=0-http' },
+      });
+
+      expect(mockRedisService.rpush).toHaveBeenCalledWith(
+        'call:signals:call-http-1:u2',
+        expect.stringContaining('"type":"offer"'),
+      );
+      expect(mockRedisService.expire).toHaveBeenCalledWith(
+        'call:signals:call-http-1:u2',
+        120,
+      );
+
+      const drained = await callsController.consumeSignals('u2', 'call-http-1');
+      expect(drained.signals).toHaveLength(1);
+      expect(drained.signals[0]).toEqual(
+        expect.objectContaining({
+          callId: 'call-http-1',
+          fromUserId: 'u1',
+          toUserId: 'u2',
+          type: 'offer',
+        }),
+      );
+
+      // Non-fatal Redis error should not throw 500
+      mockRedisService.rpush.mockRejectedValueOnce(new Error('Connection is closed'));
+      await expect(
+        callsController.sendSignal('u1', 'call-http-1', {
+          toUserId: 'u2',
+          type: 'ice-candidate',
+          candidate: { candidate: 'candidate:1' },
+        }),
+      ).resolves.toEqual(expect.objectContaining({ relayed: true }));
+    });
+
+    it('queues peer_joined signal in Redis when callee joins a call', async () => {
+      mockPrismaService.call.findUnique.mockResolvedValue({
+        id: 'call-join-1',
+        callerId: 'u1',
+        conversationId: 'conv-1',
+        callType: CallType.AUDIO,
+        status: CallStatus.RINGING,
+        startedAt: null,
+        participants: [{ userId: 'u1', leftAt: null }],
+      });
+      mockPrismaService.conversationMember.findFirst.mockResolvedValue({
+        conversationId: 'conv-1',
+        userId: 'u2',
+        isActive: true,
+      });
+      mockPrismaService.callParticipant.findMany.mockResolvedValueOnce([
+        { userId: 'u1', user: { id: 'u1', displayName: 'Alice' } },
+      ]);
+      mockPrismaService.callParticipant.upsert.mockResolvedValueOnce({
+        id: 'cp-2',
+        callId: 'call-join-1',
+        userId: 'u2',
+        user: { id: 'u2', displayName: 'Bob' },
+      });
+      mockPrismaService.call.update.mockResolvedValueOnce({
+        id: 'call-join-1',
+        status: CallStatus.ONGOING,
+      });
+
+      const joined = await callsController.joinCall('u2', 'call-join-1');
+      expect(joined.call.status).toBe(CallStatus.ONGOING);
+      expect(mockRedisService.rpush).toHaveBeenCalledWith(
+        'call:signals:call-join-1:u1',
+        expect.stringContaining('"type":"peer_joined"'),
       );
     });
   });

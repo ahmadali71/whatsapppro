@@ -33,7 +33,7 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
   const navigate = useNavigate();
   const { user, requires2FA, is2FAVerified, verify2FA, isLoading } = useAuthStore();
   const { conversations, initSocketListeners } = useChatStore();
-  const { initCallSocketListeners } = useCallStore();
+  const { initCallSocketListeners, initCallHttpPolling } = useCallStore();
   const { resolvedTheme, setTheme } = useThemeStore();
 
   const [socketConnected, setSocketConnected] = useState(socketManager.isConnected);
@@ -52,6 +52,11 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
       unsubCall();
     };
   }, [initSocketListeners, initCallSocketListeners]);
+
+  useEffect(() => {
+    if (!user?.id || socketConnected) return;
+    return initCallHttpPolling();
+  }, [user?.id, socketConnected, initCallHttpPolling]);
 
   const totalUnread = conversations.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
 

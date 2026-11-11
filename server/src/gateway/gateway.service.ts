@@ -38,7 +38,11 @@ export class GatewayService {
    * and sync UserProfile in PostgreSQL.
    */
   async setUserOnline(userId: string, socketId: string): Promise<void> {
-    await this.redis.set(`online:${userId}`, socketId, ONLINE_TTL_SECONDS);
+    try {
+      await this.redis.set(`online:${userId}`, socketId, ONLINE_TTL_SECONDS);
+    } catch (error) {
+      this.logger.warn(`Failed to set online key for ${userId}: ${(error as Error).message}`);
+    }
 
     try {
       await this.prisma.userProfile.upsert({
@@ -56,7 +60,11 @@ export class GatewayService {
    */
   async setUserOffline(userId: string): Promise<Date> {
     const lastSeen = new Date();
-    await this.redis.del(`online:${userId}`);
+    try {
+      await this.redis.del(`online:${userId}`);
+    } catch (error) {
+      this.logger.warn(`Failed to delete online key for ${userId}: ${(error as Error).message}`);
+    }
 
     try {
       await this.prisma.userProfile.upsert({
@@ -75,15 +83,25 @@ export class GatewayService {
    * Check whether a user currently has an active socket entry in Redis.
    */
   async isUserOnline(userId: string): Promise<boolean> {
-    const exists = await this.redis.exists(`online:${userId}`);
-    return exists === 1;
+    try {
+      const exists = await this.redis.exists(`online:${userId}`);
+      return exists === 1;
+    } catch (error) {
+      this.logger.warn(`Failed to check online status for ${userId}: ${(error as Error).message}`);
+      return false;
+    }
   }
 
   /**
    * Retrieve the socket ID stored for a user in Redis.
    */
   async getUserSocket(userId: string): Promise<string | null> {
-    return this.redis.get(`online:${userId}`);
+    try {
+      return await this.redis.get(`online:${userId}`);
+    } catch (error) {
+      this.logger.warn(`Failed to get socket for ${userId}: ${(error as Error).message}`);
+      return null;
+    }
   }
 
   /**
@@ -91,10 +109,14 @@ export class GatewayService {
    */
   async setTyping(conversationId: string, userId: string, isTyping: boolean): Promise<void> {
     const key = `typing:${conversationId}:${userId}`;
-    if (isTyping) {
-      await this.redis.set(key, '1', TYPING_TTL_SECONDS);
-    } else {
-      await this.redis.del(key);
+    try {
+      if (isTyping) {
+        await this.redis.set(key, '1', TYPING_TTL_SECONDS);
+      } else {
+        await this.redis.del(key);
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to update typing key ${key}: ${(error as Error).message}`);
     }
   }
 
@@ -115,11 +137,15 @@ export class GatewayService {
     },
   ): Promise<void> {
     const key = `live_location:${conversationId}:${userId}`;
-    await this.redis.set(
-      key,
-      JSON.stringify({ ...data, userId, conversationId, updatedAt: new Date().toISOString() }),
-      3600,
-    );
+    try {
+      await this.redis.set(
+        key,
+        JSON.stringify({ ...data, userId, conversationId, updatedAt: new Date().toISOString() }),
+        3600,
+      );
+    } catch (error) {
+      this.logger.warn(`Failed to store live location ${key}: ${(error as Error).message}`);
+    }
   }
 
   /**
@@ -140,25 +166,31 @@ export class GatewayService {
       queuedAt: new Date().toISOString(),
     };
 
-    const client = this.redis.getClient();
     const key = `offline_queue:${userId}`;
-    await client.rpush(key, JSON.stringify(payload));
-    await client.expire(key, OFFLINE_QUEUE_TTL_SECONDS);
+    try {
+      await this.redis.rpush(key, JSON.stringify(payload));
+      await this.redis.expire(key, OFFLINE_QUEUE_TTL_SECONDS);
+    } catch (error) {
+      this.logger.warn(`Failed to queue offline event for ${userId}: ${(error as Error).message}`);
+    }
   }
 
   /**
    * Drain and return all queued offline events for a reconnecting user.
    */
   async flushOfflineQueue(userId: string): Promise<QueuedOfflineEvent[]> {
-    const client = this.redis.getClient();
     const key = `offline_queue:${userId}`;
-    const rawItems = await client.lrange(key, 0, -1);
+    let rawItems: string[] = [];
+    try {
+      rawItems = await this.redis.lrangeAndDel(key);
+    } catch (error) {
+      this.logger.warn(`Failed to flush offline queue for ${userId}: ${(error as Error).message}`);
+      return [];
+    }
 
     if (!rawItems || rawItems.length === 0) {
       return [];
     }
-
-    await client.del(key);
 
     const parsed: QueuedOfflineEvent[] = [];
     for (const raw of rawItems) {

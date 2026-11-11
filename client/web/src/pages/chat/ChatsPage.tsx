@@ -150,17 +150,37 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
 
   useEffect(() => socketManager.onConnectionChange(setSocketConnected), []);
 
-  // Lightweight HTTP polling when WebSocket is unavailable (e.g. serverless deployment)
+  // Fast, flicker-free HTTP polling when WebSocket is unavailable (e.g. serverless deployment)
   useEffect(() => {
     if (socketConnected) return;
-    const interval = window.setInterval(() => {
+
+    const syncNow = () => {
       if (document.visibilityState !== 'visible') return;
-      void fetchConversations();
+      void fetchConversations({ silent: true });
       if (activeConversationId) {
-        void fetchMessages(activeConversationId);
+        void fetchMessages(activeConversationId, false, { silent: true });
       }
-    }, 10000);
-    return () => window.clearInterval(interval);
+    };
+
+    const msgInterval = window.setInterval(() => {
+      if (document.visibilityState !== 'visible' || !activeConversationId) return;
+      void fetchMessages(activeConversationId, false, { silent: true });
+    }, 2500);
+
+    const convInterval = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      void fetchConversations({ silent: true });
+    }, 4000);
+
+    window.addEventListener('focus', syncNow);
+    document.addEventListener('visibilitychange', syncNow);
+
+    return () => {
+      window.clearInterval(msgInterval);
+      window.clearInterval(convInterval);
+      window.removeEventListener('focus', syncNow);
+      document.removeEventListener('visibilitychange', syncNow);
+    };
   }, [socketConnected, activeConversationId, fetchConversations, fetchMessages]);
 
   useEffect(() => {

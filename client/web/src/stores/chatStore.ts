@@ -72,8 +72,12 @@ interface ChatState {
   togglePinConversation: (conversationId: string) => void;
   togglePinMessage: (conversationId: string, messageId: string) => void;
 
-  fetchConversations: () => Promise<void>;
-  fetchMessages: (conversationId: string, loadMore?: boolean) => Promise<void>;
+  fetchConversations: (options?: { silent?: boolean }) => Promise<void>;
+  fetchMessages: (
+    conversationId: string,
+    loadMore?: boolean,
+    options?: { silent?: boolean },
+  ) => Promise<void>;
   createDirectChat: (otherUserId: string) => Promise<ConversationWithMeta>;
   sendMessage: (
     conversationId: string,
@@ -147,17 +151,39 @@ function loadPinnedMsgs(): Record<string, string[]> {
 
 async function maybeDecryptMessage(msg: Message): Promise<LocalMessage> {
   const currentUserId = useAuthStore.getState().user?.id;
-  if (msg.isEncrypted && msg.content && msg.senderId !== currentUserId) {
-    const decryptedContent = await e2eeManager.decryptMessage(msg.senderId, msg.content);
-    return { ...msg, decryptedContent };
-  }
-  // If sender is current user and content is our own encrypted envelope, check local cache or show plaintext if stored
   if (msg.isEncrypted && msg.content) {
-    const cachedPlain = sessionStorage.getItem(`e2ee_plain_${msg.id}`);
+    let cachedPlain: string | null = null;
+    try {
+      cachedPlain =
+        localStorage.getItem(`e2ee_plain_${msg.id}`) ||
+        sessionStorage.getItem(`e2ee_plain_${msg.id}`);
+    } catch {
+      // Ignore storage errors
+    }
     if (cachedPlain) {
       return { ...msg, decryptedContent: cachedPlain };
     }
   }
+
+  if (msg.isEncrypted && msg.content && msg.senderId !== currentUserId) {
+    const decryptedContent = await e2eeManager.decryptMessage(msg.senderId, msg.content);
+    if (
+      decryptedContent &&
+      !decryptedContent.startsWith('🔒 Encrypted message (unable to decrypt')
+    ) {
+      try {
+        localStorage.setItem(`e2ee_plain_${msg.id}`, decryptedContent);
+      } catch {
+        // Ignore storage quota errors
+      }
+    }
+    return { ...msg, decryptedContent };
+  }
+
+  if (msg.isEncrypted && msg.content && msg.content.startsWith('{"v":1,"type":')) {
+    return { ...msg, decryptedContent: '🔒 Encrypted message (sent from another session)' };
+  }
+
   return { ...msg, decryptedContent: msg.content || undefined };
 }
 
@@ -287,8 +313,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  fetchConversations: async () => {
-    set({ isLoadingConversations: true });
+  fetchConversations: async (options) => {
+    const silent = Boolean(options?.silent);
+    if (!silent) {
+      set({ isLoadingConversations: true });
+    }
     try {
       const res = await api.get('/chats');
       const raw = unwrapData<ConversationWithMeta[] | { items?: ConversationWithMeta[]; conversations?: ConversationWithMeta[] }>(
@@ -317,18 +346,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({
         conversations: decryptedList,
         onlineUsers: onlineMap,
-        isLoadingConversations: false,
+        ...(silent ? {} : { isLoadingConversations: false }),
       });
     } catch {
-      set({ isLoadingConversations: false });
+      if (!silent) {
+        set({ isLoadingConversations: false });
+      }
     }
   },
 
-  fetchMessages: async (conversationId, loadMore = false) => {
+  fetchMessages: async (conversationId, loadMore = false, options) => {
+    const silent = Boolean(options?.silent);
     const cursor = loadMore ? get().nextCursorByConv[conversationId] : undefined;
     if (loadMore && !cursor) return;
 
-    set({ isLoadingMessages: true });
+    if (!silent) {
+      set({ isLoadingMessages: true });
+    }
     try {
       const res = await api.get(`/chats/${conversationId}/messages`, {
         params: { cursor: cursor || undefined, limit: 40 },
@@ -342,7 +376,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const hasMore = Array.isArray(raw) ? items.length >= 40 : Boolean(raw?.hasMore ?? nextCursor);
 
       const decrypted = await Promise.all(items.map(maybeDecryptMessage));
-      const existing = loadMore ? get().messagesByConv[conversationId] || [] : [];
+      const currentList = get().messagesByConv[conversationId] || [];
+      const existing = loadMore
+        ? currentList
+        : currentList.filter((m) => m.id.startsWith('temp-') && m.clientStatus === 'sending');
 
       // Merge & sort chronologically
       const mergedMap = new Map<string, LocalMessage>();
@@ -353,12 +390,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       set((state) => ({
         messagesByConv: { ...state.messagesByConv, [conversationId]: sorted },
-        nextCursorByConv: { ...state.nextCursorByConv, [conversationId]: nextCursor },
-        hasMoreByConv: { ...state.hasMoreByConv, [conversationId]: hasMore },
-        isLoadingMessages: false,
+        ...(silent
+          ? {}
+          : {
+              nextCursorByConv: { ...state.nextCursorByConv, [conversationId]: nextCursor },
+              hasMoreByConv: { ...state.hasMoreByConv, [conversationId]: hasMore },
+              isLoadingMessages: false,
+            }),
       }));
     } catch {
-      set({ isLoadingMessages: false });
+      if (!silent) {
+        set({ isLoadingMessages: false });
+      }
     }
   },
 
@@ -467,7 +510,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const saved = unwrapData<Message>(res.data);
       if (isEncrypted && payload.content) {
-        sessionStorage.setItem(`e2ee_plain_${saved.id}`, payload.content);
+        try {
+          localStorage.setItem(`e2ee_plain_${saved.id}`, payload.content);
+        } catch {
+          // Ignore storage quota errors
+        }
+        try {
+          sessionStorage.setItem(`e2ee_plain_${saved.id}`, payload.content);
+        } catch {
+          // Ignore storage errors
+        }
       }
       const normalized: LocalMessage = {
         ...saved,
