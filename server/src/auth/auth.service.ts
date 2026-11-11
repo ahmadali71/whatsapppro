@@ -2,8 +2,10 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -120,68 +122,109 @@ export class AuthService {
     return this.sanitizeUser(user);
   }
 
-  async register(dto: RegisterDto) {
-    const existingByPhone = await this.prisma.user.findUnique({
-      where: { phoneNumber: dto.phone },
-    });
-
-    if (existingByPhone && !existingByPhone.deletedAt && existingByPhone.isVerified) {
-      throw new ConflictException('A verified account with this phone number already exists');
-    }
-
-    if (dto.username) {
-      const existingByUsername = await this.prisma.user.findUnique({
-        where: { username: dto.username },
-      });
-      if (
-        existingByUsername &&
-        (!existingByPhone || existingByUsername.id !== existingByPhone.id)
-      ) {
-        throw new ConflictException('Username is already taken');
+  private ensureDatabaseConnected(): void {
+    const status = (
+      this.prisma as unknown as {
+        getStatus?: () => { connected: boolean; error?: string | null };
       }
+    ).getStatus?.();
+
+    if (status && !status.connected) {
+      throw new ServiceUnavailableException(
+        'Database is not connected. Configure DATABASE_URL in your deployment environment variables.',
+      );
     }
+  }
 
-    const user = existingByPhone
-      ? await this.prisma.user.update({
-          where: { id: existingByPhone.id },
-          data: {
-            countryCode: dto.country_code,
-            displayName: dto.display_name,
-            username: dto.username ?? existingByPhone.username,
-            recoveryEmail: dto.recovery_email ?? existingByPhone.recoveryEmail,
-            isActive: true,
-            deletedAt: null,
-          },
-        })
-      : await this.prisma.user.create({
-          data: {
-            phoneNumber: dto.phone,
-            countryCode: dto.country_code,
-            displayName: dto.display_name,
-            username: dto.username,
-            recoveryEmail: dto.recovery_email,
-            profile: {
-              create: {
-                isOnline: false,
-                lastSeen: new Date(),
-              },
-            },
-            privacySettings: { create: {} },
-            chatSettings: { create: {} },
-          },
+  private async executeWithDbGuard<T>(operation: () => Promise<T>): Promise<T> {
+    this.ensureDatabaseConnected();
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      const name = error instanceof Error ? error.name : '';
+      if (
+        name === 'PrismaClientInitializationError' ||
+        /Can't reach database server|ECONNREFUSED|ETIMEDOUT|Connection terminated|Environment variable not found: DATABASE_URL/i.test(
+          message,
+        )
+      ) {
+        throw new ServiceUnavailableException(
+          'Database is not connected. Configure DATABASE_URL in your deployment environment variables.',
+        );
+      }
+      throw error;
+    }
+  }
+
+  async register(dto: RegisterDto) {
+    return this.executeWithDbGuard(async () => {
+      const existingByPhone = await this.prisma.user.findUnique({
+        where: { phoneNumber: dto.phone },
+      });
+
+      if (existingByPhone && !existingByPhone.deletedAt && existingByPhone.isVerified) {
+        throw new ConflictException('A verified account with this phone number already exists');
+      }
+
+      if (dto.username) {
+        const existingByUsername = await this.prisma.user.findUnique({
+          where: { username: dto.username },
         });
+        if (
+          existingByUsername &&
+          (!existingByPhone || existingByUsername.id !== existingByPhone.id)
+        ) {
+          throw new ConflictException('Username is already taken');
+        }
+      }
 
-    const otpResult = await this.otpService.sendOtp(user.phoneNumber);
+      const user = existingByPhone
+        ? await this.prisma.user.update({
+            where: { id: existingByPhone.id },
+            data: {
+              countryCode: dto.country_code,
+              displayName: dto.display_name,
+              username: dto.username ?? existingByPhone.username,
+              recoveryEmail: dto.recovery_email ?? existingByPhone.recoveryEmail,
+              isActive: true,
+              deletedAt: null,
+            },
+          })
+        : await this.prisma.user.create({
+            data: {
+              phoneNumber: dto.phone,
+              countryCode: dto.country_code,
+              displayName: dto.display_name,
+              username: dto.username,
+              recoveryEmail: dto.recovery_email,
+              profile: {
+                create: {
+                  isOnline: false,
+                  lastSeen: new Date(),
+                },
+              },
+              privacySettings: { create: {} },
+              chatSettings: { create: {} },
+            },
+          });
 
-    return {
-      user: this.sanitizeUser(user),
-      otp_sent: true,
-      expires_in: otpResult.expiresIn,
-      ...(otpResult.devOtp ? { dev_otp: otpResult.devOtp } : {}),
-    };
+      const otpResult = await this.otpService.sendOtp(user.phoneNumber);
+
+      return {
+        user: this.sanitizeUser(user),
+        otp_sent: true,
+        expires_in: otpResult.expiresIn,
+        ...(otpResult.devOtp ? { dev_otp: otpResult.devOtp } : {}),
+      };
+    });
   }
 
   async sendOtp(dto: SendOtpDto) {
+    this.ensureDatabaseConnected();
     const otpResult = await this.otpService.sendOtp(dto.phone_number);
     return {
       phone_number: dto.phone_number,
@@ -196,11 +239,15 @@ export class AuthService {
     ipAddress?: string,
     userAgent?: string,
   ) {
-    return this.authenticateWithOtp(dto, ipAddress, userAgent);
+    return this.executeWithDbGuard(() =>
+      this.authenticateWithOtp(dto, ipAddress, userAgent),
+    );
   }
 
   async login(dto: LoginDto, ipAddress?: string, userAgent?: string) {
-    return this.authenticateWithOtp(dto, ipAddress, userAgent);
+    return this.executeWithDbGuard(() =>
+      this.authenticateWithOtp(dto, ipAddress, userAgent),
+    );
   }
 
   private async authenticateWithOtp(

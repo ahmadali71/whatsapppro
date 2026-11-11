@@ -6,6 +6,8 @@ import {
   ConflictException,
   HttpException,
   HttpStatus,
+  InternalServerErrorException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { AuthController } from '../src/auth/auth.controller';
@@ -361,6 +363,83 @@ describe('Auth & OTP Integration/Unit Suite', () => {
       await expect(authService.verify2FA('user-1', { pin: '000000' })).rejects.toThrow(
         UnauthorizedException,
       );
+    });
+  });
+
+  describe('Production dev-OTP fallback & 503 dependency guards', () => {
+    it('returns devOtp in production when Twilio is unconfigured unless ALLOW_DEV_OTP_FALLBACK=false', async () => {
+      const prodFallbackOtpService = new OtpService(
+        mockRedisService as any,
+        {
+          get: jest.fn((key: string, def?: string) => {
+            if (key === 'NODE_ENV') return 'production';
+            return def;
+          }),
+        } as any,
+      );
+
+      const res = await prodFallbackOtpService.sendOtp('+15550100111');
+      expect(res.expiresIn).toBe(300);
+      expect(res.devOtp).toMatch(/^\d{6}$/);
+
+      const strictProdOtpService = new OtpService(
+        mockRedisService as any,
+        {
+          get: jest.fn((key: string, def?: string) => {
+            if (key === 'NODE_ENV') return 'production';
+            if (key === 'ALLOW_DEV_OTP_FALLBACK') return 'false';
+            return def;
+          }),
+        } as any,
+      );
+
+      await expect(strictProdOtpService.sendOtp('+15550100112')).rejects.toThrow(
+        InternalServerErrorException,
+      );
+    });
+
+    it('throws ServiceUnavailableException (503) when Redis is disconnected', async () => {
+      const disconnectedRedisOtpService = new OtpService(
+        {
+          ...mockRedisService,
+          getStatus: () => ({ connected: false, error: 'Connection is closed.' }),
+        } as any,
+        mockConfigService as any,
+      );
+
+      await expect(disconnectedRedisOtpService.sendOtp('+15550100222')).rejects.toThrow(
+        ServiceUnavailableException,
+      );
+      await expect(
+        disconnectedRedisOtpService.verifyOtp('+15550100222', '123456'),
+      ).rejects.toThrow(ServiceUnavailableException);
+    });
+
+    it('throws ServiceUnavailableException (503) when Database is disconnected', async () => {
+      const disconnectedDbAuthService = new AuthService(
+        {
+          ...mockPrismaService,
+          getStatus: () => ({ connected: false, error: 'Connection refused' }),
+        } as any,
+        new JwtService(),
+        mockConfigService as any,
+        otpService,
+      );
+
+      await expect(
+        disconnectedDbAuthService.sendOtp({
+          phone_number: '+15550100333',
+          country_code: '+1',
+        }),
+      ).rejects.toThrow(ServiceUnavailableException);
+
+      await expect(
+        disconnectedDbAuthService.register({
+          phone: '+15550100333',
+          country_code: '+1',
+          display_name: 'Offline Test',
+        }),
+      ).rejects.toThrow(ServiceUnavailableException);
     });
   });
 });
