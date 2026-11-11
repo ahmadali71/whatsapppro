@@ -159,9 +159,40 @@ export class CallsService {
     });
 
     if (existingActiveCall) {
-      throw new ConflictException(
-        `An active call (${existingActiveCall.id}) already exists in this conversation`,
-      );
+      const createdAtMs = existingActiveCall.createdAt
+        ? new Date(existingActiveCall.createdAt).getTime()
+        : NaN;
+      const isStaleRinging =
+        (existingActiveCall.status === CallStatus.INITIATED ||
+          existingActiveCall.status === CallStatus.RINGING) &&
+        Number.isFinite(createdAtMs) &&
+        Date.now() - createdAtMs > 90_000;
+
+      if (isStaleRinging) {
+        const now = new Date();
+        await this.prisma.$transaction(async (tx) => {
+          await tx.call.update({
+            where: { id: existingActiveCall.id },
+            data: {
+              status: CallStatus.MISSED,
+              endedAt: now,
+              durationSeconds: 0,
+            },
+          });
+          await tx.callParticipant.updateMany({
+            where: { callId: existingActiveCall.id, leftAt: null },
+            data: { leftAt: now },
+          });
+        });
+        await this.redis.del(`call:peers:${existingActiveCall.id}`);
+        this.logger.warn(
+          `Auto-closed stale ${existingActiveCall.status} call ${existingActiveCall.id} (>90s) before initiating new call`,
+        );
+      } else {
+        throw new ConflictException(
+          `An active call (${existingActiveCall.id}) already exists in this conversation`,
+        );
+      }
     }
 
     const call = await this.prisma.$transaction(async (tx) => {

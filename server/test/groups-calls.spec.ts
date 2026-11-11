@@ -408,11 +408,49 @@ describe('Groups & WebRTC Calls Suite', () => {
       );
       expect(mockNotificationsService.sendCallNotification).toHaveBeenCalled();
 
-      // Duplicate active call rejected
+      // Duplicate active call rejected (recent or missing createdAt)
       mockPrismaService.call.findFirst.mockResolvedValueOnce({ id: 'call-1' });
       await expect(
         callsService.initiateCall('u1', 'conv-1', CallType.AUDIO),
       ).rejects.toThrow(ConflictException);
+
+      // Recent RINGING call (< 90s) still throws ConflictException
+      mockPrismaService.call.findFirst.mockResolvedValueOnce({
+        id: 'call-recent',
+        status: CallStatus.RINGING,
+        createdAt: new Date(Date.now() - 10_000),
+      });
+      await expect(
+        callsService.initiateCall('u1', 'conv-1', CallType.AUDIO),
+      ).rejects.toThrow(ConflictException);
+
+      // Stale RINGING call (> 90s) is auto-closed as MISSED and allows new call
+      mockPrismaService.call.findFirst.mockResolvedValueOnce({
+        id: 'call-stale',
+        status: CallStatus.RINGING,
+        createdAt: new Date(Date.now() - 120_000),
+      });
+      mockPrismaService.call.create.mockResolvedValueOnce({
+        id: 'call-new',
+        callerId: 'u1',
+        conversationId: 'conv-1',
+        callType: CallType.AUDIO,
+        status: CallStatus.RINGING,
+        caller: { id: 'u1', displayName: 'Alice' },
+      });
+
+      const retried = await callsService.initiateCall('u1', 'conv-1', CallType.AUDIO);
+      expect(retried.call.id).toBe('call-new');
+      expect(mockPrismaService.call.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'call-stale' },
+          data: expect.objectContaining({
+            status: CallStatus.MISSED,
+            durationSeconds: 0,
+          }),
+        }),
+      );
+      expect(mockRedisService.del).toHaveBeenCalledWith('call:peers:call-stale');
     });
 
     it('relays SDP offer, SDP answer, and ICE candidates via CallsGateway', async () => {

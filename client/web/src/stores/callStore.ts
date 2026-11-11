@@ -123,6 +123,50 @@ async function flushPendingSignalsForCall(callId: string) {
   }
 }
 
+function isValidCallId(callId?: string | null): callId is string {
+  return (
+    typeof callId === 'string' &&
+    callId.trim().length > 0 &&
+    callId !== 'undefined' &&
+    callId !== 'null'
+  );
+}
+
+function extractCallId(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const obj = payload as {
+    id?: string;
+    callId?: string;
+    call?: { id?: string; callId?: string };
+  };
+  const candidate = obj.call?.id ?? obj.call?.callId ?? obj.id ?? obj.callId;
+  return isValidCallId(candidate) ? candidate : undefined;
+}
+
+async function findStaleCallId(err: unknown): Promise<string | undefined> {
+  const axiosErr = err as {
+    response?: { status?: number; data?: { message?: string | string[] } };
+  };
+  if (axiosErr?.response?.status !== 409) return undefined;
+
+  const rawMsg = axiosErr.response.data?.message;
+  const msgText = Array.isArray(rawMsg) ? rawMsg.join(' ') : String(rawMsg || '');
+  const uuidMatch = msgText.match(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+  );
+  if (uuidMatch && isValidCallId(uuidMatch[0])) {
+    return uuidMatch[0];
+  }
+
+  try {
+    const activeRes = await api.get('/calls/active');
+    const activeData = unwrapData<{ id?: string; call?: { id?: string } } | null>(activeRes.data);
+    return extractCallId(activeData);
+  } catch {
+    return undefined;
+  }
+}
+
 function startDurationTimer(set: (partial: Partial<CallState>) => void) {
   if (durationTimerId) return;
   const startTime = Date.now();
@@ -164,60 +208,93 @@ export const useCallStore = create<CallState>((set, get) => ({
 
   initiateCall: async (conversationId, callType, peerUsers) => {
     const isVideo = callType === CallType.VIDEO;
-    const localStream = await webrtcManager.startLocalMedia(isVideo);
+    try {
+      const localStream = await webrtcManager.startLocalMedia(isVideo);
 
-    const res = await api.post('/calls', {
-      conversationId,
-      callType,
-    });
-    const callRecord = unwrapData<Call>(res.data);
-
-    await webrtcManager.initCall(callRecord.id, isVideo);
-    webrtcManager.setHandlers({
-      onRemoteStream: (peerId, stream) => {
-        set((s) => ({
-          remoteStreams: { ...s.remoteStreams, [peerId]: stream },
-          activeCall: s.activeCall ? { ...s.activeCall, status: CallStatus.ONGOING } : null,
-        }));
-      },
-      onPeerRemoved: (peerId) => {
-        set((s) => {
-          const next = { ...s.remoteStreams };
-          delete next[peerId];
-          return { remoteStreams: next };
+      let res;
+      try {
+        res = await api.post('/calls', {
+          conversationId,
+          callType,
         });
-      },
-      onQualityUpdate: (stats) => set({ connectionQuality: stats }),
-    });
-
-    set({
-      activeCall: {
-        id: callRecord.id,
-        callType,
-        conversationId,
-        status: CallStatus.RINGING,
-        isOutgoing: true,
-        peerUsers,
-      },
-      localStream,
-      isMuted: false,
-      isCameraOff: !isVideo,
-      isScreenSharing: false,
-      durationSeconds: 0,
-    });
-
-    // Proactively send WebRTC offers to known peers
-    const currentUserId = useAuthStore.getState().user?.id;
-    for (const peer of peerUsers) {
-      if (peer.id !== currentUserId) {
-        await webrtcManager.createOfferForPeer(peer.id, callRecord.id);
+      } catch (err) {
+        const staleId = await findStaleCallId(err);
+        if (staleId) {
+          await api.post(`/calls/${staleId}/end`).catch(() => {});
+          res = await api.post('/calls', {
+            conversationId,
+            callType,
+          });
+        } else {
+          throw err;
+        }
       }
+
+      const unwrapped = unwrapData<Call | { call?: Call; callId?: string }>(res.data);
+      const callId = extractCallId(unwrapped);
+      if (!isValidCallId(callId)) {
+        throw new Error('Server did not return a valid call ID');
+      }
+
+      await webrtcManager.initCall(callId, isVideo);
+      webrtcManager.setHandlers({
+        onRemoteStream: (peerId, stream) => {
+          set((s) => ({
+            remoteStreams: { ...s.remoteStreams, [peerId]: stream },
+            activeCall: s.activeCall ? { ...s.activeCall, status: CallStatus.ONGOING } : null,
+          }));
+        },
+        onPeerRemoved: (peerId) => {
+          set((s) => {
+            const next = { ...s.remoteStreams };
+            delete next[peerId];
+            return { remoteStreams: next };
+          });
+        },
+        onQualityUpdate: (stats) => set({ connectionQuality: stats }),
+      });
+
+      set({
+        activeCall: {
+          id: callId,
+          callType,
+          conversationId,
+          status: CallStatus.RINGING,
+          isOutgoing: true,
+          peerUsers,
+        },
+        localStream,
+        isMuted: false,
+        isCameraOff: !isVideo,
+        isScreenSharing: false,
+        durationSeconds: 0,
+      });
+
+      // Proactively send WebRTC offers to known peers
+      const currentUserId = useAuthStore.getState().user?.id;
+      for (const peer of peerUsers) {
+        if (peer.id !== currentUserId) {
+          await webrtcManager.createOfferForPeer(peer.id, callId);
+        }
+      }
+    } catch (err) {
+      webrtcManager.cleanup();
+      set({
+        activeCall: null,
+        localStream: null,
+        remoteStreams: {},
+        isMuted: false,
+        isCameraOff: false,
+        isScreenSharing: false,
+        durationSeconds: 0,
+      });
+      throw err;
     }
   },
 
   acceptIncomingCall: async () => {
     const incoming = get().incomingCall;
-    if (!incoming) return;
+    if (!incoming || !isValidCallId(incoming.id)) return;
     ringtone.stop();
 
     const isVideo = incoming.callType === CallType.VIDEO;
@@ -261,13 +338,15 @@ export const useCallStore = create<CallState>((set, get) => ({
     const incoming = get().incomingCall;
     if (!incoming) return;
     ringtone.stop();
-    clearPendingSignals(incoming.id);
-    try {
-      await api.post(`/calls/${incoming.id}/reject`);
-    } catch {
-      // Ignore
+    if (isValidCallId(incoming.id)) {
+      clearPendingSignals(incoming.id);
+      try {
+        await api.post(`/calls/${incoming.id}/reject`);
+      } catch {
+        // Ignore
+      }
+      socketManager.emit('call_reject', { callId: incoming.id }, false);
     }
-    socketManager.emit('call_reject', { callId: incoming.id }, false);
     set({ incomingCall: null });
   },
 
@@ -277,7 +356,7 @@ export const useCallStore = create<CallState>((set, get) => ({
     stopDurationTimer();
     webrtcManager.cleanup();
 
-    if (active) {
+    if (active && isValidCallId(active.id)) {
       clearPendingSignals(active.id);
       try {
         await api.post(`/calls/${active.id}/end`);
@@ -303,7 +382,7 @@ export const useCallStore = create<CallState>((set, get) => ({
     const nextMuted = !get().isMuted;
     webrtcManager.setAudioMuted(nextMuted);
     const active = get().activeCall;
-    if (active) {
+    if (active && isValidCallId(active.id)) {
       socketManager.emit('call_toggle_mute', { callId: active.id, isMuted: nextMuted }, false);
     }
     set({ isMuted: nextMuted });
@@ -313,7 +392,7 @@ export const useCallStore = create<CallState>((set, get) => ({
     const nextOff = !get().isCameraOff;
     webrtcManager.setVideoEnabled(!nextOff);
     const active = get().activeCall;
-    if (active) {
+    if (active && isValidCallId(active.id)) {
       socketManager.emit('call_toggle_video', { callId: active.id, isVideoOn: !nextOff }, false);
     }
     set({ isCameraOff: nextOff });
