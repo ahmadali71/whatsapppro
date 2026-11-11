@@ -18,7 +18,6 @@ import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { v4 as uuidv4 } from 'uuid';
-import sharp = require('sharp');
 
 const execFileAsync = promisify(execFile);
 
@@ -229,19 +228,29 @@ export class MediaService {
   }
 
   /**
-   * Compress and resize an image buffer using sharp.
+   * Compress and resize an image buffer using sharp (lazy-loaded so serverless
+   * environments without sharp native binaries do not crash on module load).
    */
   async compressImage(buffer: Buffer): Promise<Buffer> {
-    return sharp(buffer)
-      .rotate()
-      .resize({
-        width: 2048,
-        height: 2048,
-        fit: 'inside',
-        withoutEnlargement: true,
-      })
-      .webp({ quality: 82 })
-      .toBuffer();
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const sharpLib = require('sharp') as typeof import('sharp');
+      return await sharpLib(buffer)
+        .rotate()
+        .resize({
+          width: 2048,
+          height: 2048,
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
+        .webp({ quality: 82 })
+        .toBuffer();
+    } catch (error) {
+      this.logger.warn(
+        `sharp unavailable or failed; returning original image buffer: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return buffer;
+    }
   }
 
   /**

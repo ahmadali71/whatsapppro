@@ -23,9 +23,6 @@ interface ApnModule {
   Notification: new () => ApnNotificationInstance;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const apn = require('@parse/node-apn') as ApnModule;
-
 export interface PushNotificationPayload {
   title: string;
   body: string;
@@ -36,6 +33,7 @@ export interface PushNotificationPayload {
 export class NotificationsService implements OnModuleInit {
   private readonly logger = new Logger(NotificationsService.name);
   private firebaseApp: admin.app.App | null = null;
+  private apnModule: ApnModule | null = null;
   private apnProvider: ApnProviderInstance | null = null;
 
   constructor(
@@ -103,9 +101,12 @@ export class NotificationsService implements OnModuleInit {
     }
 
     try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const apn = require('@parse/node-apn') as ApnModule;
       const production =
         this.configService.get<string>('NODE_ENV', 'development') === 'production';
 
+      this.apnModule = apn;
       this.apnProvider = new apn.Provider({
         token: {
           key: key ? key.replace(/\\n/g, '\n') : (keyPath as string),
@@ -278,7 +279,7 @@ export class NotificationsService implements OnModuleInit {
     token: string,
     notification: PushNotificationPayload,
   ): Promise<boolean> {
-    if (!this.apnProvider) {
+    if (!this.apnProvider || !this.apnModule) {
       this.logger.debug(
         `Skipping APNs send (APNs not configured) for token ${token.slice(0, 8)}...`,
       );
@@ -286,7 +287,7 @@ export class NotificationsService implements OnModuleInit {
     }
 
     try {
-      const apnNote = new apn.Notification();
+      const apnNote = new this.apnModule.Notification();
       apnNote.expiry = Math.floor(Date.now() / 1000) + 3600;
       apnNote.sound = 'default';
       apnNote.alert = {
