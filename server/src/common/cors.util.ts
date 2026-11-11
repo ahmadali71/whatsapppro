@@ -1,6 +1,11 @@
 const DEFAULT_CORS_ORIGINS =
   'https://web-9b56.vercel.app,http://localhost:3000,http://localhost:3001';
 const ALWAYS_ALLOWED_ORIGINS = ['https://web-9b56.vercel.app'];
+const VERCEL_ORIGIN_ENV_KEYS = [
+  'VERCEL_URL',
+  'VERCEL_BRANCH_URL',
+  'VERCEL_PROJECT_PRODUCTION_URL',
+] as const;
 
 function normalizeOrigin(origin: string): string {
   return origin
@@ -33,6 +38,14 @@ function buildAllowedOrigins(rawOrigins?: string, frontendUrl?: string): {
     const normalizedFrontend = normalizeOrigin(effectiveFrontend);
     if (normalizedFrontend) {
       origins.add(normalizedFrontend);
+    }
+  }
+  for (const envKey of VERCEL_ORIGIN_ENV_KEYS) {
+    const rawHost = process.env[envKey];
+    if (!rawHost) continue;
+    const host = normalizeOrigin(rawHost).replace(/^https?:\/\//i, '');
+    if (host) {
+      origins.add(`https://${host}`);
     }
   }
 

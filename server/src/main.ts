@@ -5,6 +5,7 @@ import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import type { NextFunction, Request, Response } from 'express';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
@@ -29,7 +30,9 @@ async function bootstrap() {
   );
 
   // Serve local-dev uploaded media assets at /uploads/*
-  const uploadsDir = path.resolve(process.cwd(), 'uploads');
+  const uploadsDir = process.env.VERCEL
+    ? path.join(os.tmpdir(), 'whatsapp-pro-uploads')
+    : path.resolve(process.cwd(), 'uploads');
   fs.mkdirSync(uploadsDir, { recursive: true });
   app.useStaticAssets(uploadsDir, { prefix: '/uploads/' });
 

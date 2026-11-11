@@ -62,9 +62,9 @@ prisma/migrations/**/migration_lock.toml
 nginx/certs/
 
 # Uploads / Media
-uploads/
+/uploads/
 server/uploads/
-media/
+/media/
 
 # Android / Gradle / Native builds
 .gradle/
