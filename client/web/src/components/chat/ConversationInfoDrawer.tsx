@@ -168,7 +168,7 @@ export const ConversationInfoDrawer: React.FC<ConversationInfoDrawerProps> = ({
       return;
     }
     try {
-      const res = await searchUsers(q, q.startsWith('+') ? 'phone' : 'username');
+      const res = await searchUsers(q.trim());
       setSearchResults(res);
     } catch {
       setSearchResults([]);

@@ -33,6 +33,7 @@ describe('Users, Contacts, Privacy, Blocking & E2EE Keys Suite', () => {
       findUnique: jest.fn(),
       findMany: jest.fn(),
       upsert: jest.fn(),
+      deleteMany: jest.fn(),
     },
     userKeyBundle: {
       upsert: jest.fn(),
@@ -116,6 +117,65 @@ describe('Users, Contacts, Privacy, Blocking & E2EE Keys Suite', () => {
       expect(res.success).toBe(true);
       expect(res.data).toHaveLength(1);
       expect(mockPrismaService.contact.upsert).toHaveBeenCalledTimes(1);
+    });
+
+    it('adds a single registered contact by phone number and throws 404 when unregistered', async () => {
+      mockPrismaService.user.findFirst.mockResolvedValue({
+        id: 'u2',
+        displayName: 'Bob Smith',
+      });
+      mockPrismaService.contact.upsert.mockResolvedValue({
+        id: 'contact-2',
+        ownerId: 'u1',
+        contactId: 'u2',
+        nickname: 'Bobby',
+        contactUser: {
+          id: 'u2',
+          phoneNumber: '+15550100002',
+          displayName: 'Bob Smith',
+        },
+      });
+
+      const added = await usersController.addContact('u1', {
+        phone_number: '+15550100002',
+        nickname: '  Bobby  ',
+      });
+
+      expect(added.success).toBe(true);
+      expect(added.data.nickname).toBe('Bobby');
+      expect(mockPrismaService.contact.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({
+            ownerId: 'u1',
+            contactId: 'u2',
+            nickname: 'Bobby',
+          }),
+        }),
+      );
+
+      mockPrismaService.user.findFirst.mockResolvedValue(null);
+      await expect(
+        usersController.addContact('u1', { phone_number: '+15550999999' }),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('removes a saved contact by contactId or record id and throws 404 if missing', async () => {
+      mockPrismaService.contact.deleteMany.mockResolvedValue({ count: 1 });
+
+      const removed = await usersController.removeContact('u1', 'u2');
+      expect(removed.success).toBe(true);
+      expect(removed.data).toEqual({ removed: true, contact_id: 'u2' });
+      expect(mockPrismaService.contact.deleteMany).toHaveBeenCalledWith({
+        where: {
+          ownerId: 'u1',
+          OR: [{ contactId: 'u2' }, { id: 'u2' }],
+        },
+      });
+
+      mockPrismaService.contact.deleteMany.mockResolvedValue({ count: 0 });
+      await expect(usersController.removeContact('u1', 'missing-id')).rejects.toThrow(
+        NotFoundException,
+      );
     });
   });
 

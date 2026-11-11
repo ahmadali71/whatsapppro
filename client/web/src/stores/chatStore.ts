@@ -107,6 +107,8 @@ interface ChatState {
   markConversationRead: (conversationId: string) => void;
 
   fetchContacts: () => Promise<void>;
+  addContact: (phoneNumber: string, nickname?: string) => Promise<Contact>;
+  removeContact: (contactId: string) => Promise<void>;
   syncContacts: (phones: string[]) => Promise<Contact[]>;
   searchUsers: (query: string, type?: 'phone' | 'username') => Promise<User[]>;
   fetchBlockedUsers: () => Promise<void>;
@@ -795,18 +797,64 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  syncContacts: async (phones) => {
-    const res = await api.post('/users/contacts/sync', {
-      contacts: phones.map((phone_number) => ({ phone_number })),
-    });
-    const data = unwrapData<Contact[]>(res.data);
-    const list = Array.isArray(data) ? data : [];
-    set({ contacts: list });
-    return list;
+  addContact: async (phoneNumber, nickname) => {
+    try {
+      const trimmedNickname = nickname?.trim();
+      const res = await api.post('/users/contacts', {
+        phone_number: phoneNumber.trim(),
+        ...(trimmedNickname ? { nickname: trimmedNickname } : {}),
+      });
+      const contact = unwrapData<Contact>(res.data);
+      set((state) => {
+        const exists = state.contacts.some(
+          (c) => c.id === contact.id || c.contactId === contact.contactId,
+        );
+        return {
+          contacts: exists
+            ? state.contacts.map((c) =>
+                c.id === contact.id || c.contactId === contact.contactId ? contact : c,
+              )
+            : [contact, ...state.contacts],
+        };
+      });
+      await get().fetchContacts();
+      return contact;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err, 'Failed to add contact'));
+    }
   },
 
-  searchUsers: async (query, type = 'username') => {
-    const res = await api.get('/users/search', { params: { q: query, type } });
+  removeContact: async (contactId) => {
+    try {
+      await api.delete(`/users/contacts/${contactId}`);
+      set((state) => ({
+        contacts: state.contacts.filter(
+          (c) => c.id !== contactId && c.contactId !== contactId,
+        ),
+      }));
+    } catch (err) {
+      throw new Error(extractErrorMessage(err, 'Failed to remove contact'));
+    }
+  },
+
+  syncContacts: async (phones) => {
+    try {
+      const res = await api.post('/users/contacts/sync', {
+        contacts: phones.map((phone_number) => ({ phone_number })),
+      });
+      const data = unwrapData<Contact[]>(res.data);
+      const list = Array.isArray(data) ? data : [];
+      await get().fetchContacts();
+      return list;
+    } catch (err) {
+      throw new Error(extractErrorMessage(err, 'Failed to sync contacts'));
+    }
+  },
+
+  searchUsers: async (query, type) => {
+    const res = await api.get('/users/search', {
+      params: type ? { q: query, type } : { q: query },
+    });
     const data = unwrapData<User[]>(res.data);
     return Array.isArray(data) ? data : [];
   },

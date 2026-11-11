@@ -9,8 +9,28 @@ import { VisibilityScope } from '@prisma/client';
 import { OtpService } from '../otp/otp.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { SearchUsersDto, UserSearchType } from './dto/search-users.dto';
-import { SyncContactsDto } from './dto/sync-contacts.dto';
+import { AddContactDto, SyncContactsDto } from './dto/sync-contacts.dto';
 import { ChangeNumberDto, UpdateProfileDto } from './dto/update-profile.dto';
+
+const CONTACT_USER_INCLUDE = {
+  contactUser: {
+    select: {
+      id: true,
+      phoneNumber: true,
+      countryCode: true,
+      username: true,
+      displayName: true,
+      about: true,
+      avatarUrl: true,
+      profile: {
+        select: {
+          isOnline: true,
+          lastSeen: true,
+        },
+      },
+    },
+  },
+} as const;
 
 const SAFE_USER_SELECT = {
   id: true,
@@ -419,30 +439,69 @@ export class UsersService {
           update: {
             ...(nickname ? { nickname } : {}),
           },
-          include: {
-            contactUser: {
-              select: {
-                id: true,
-                phoneNumber: true,
-                countryCode: true,
-                username: true,
-                displayName: true,
-                about: true,
-                avatarUrl: true,
-                profile: {
-                  select: {
-                    isOnline: true,
-                    lastSeen: true,
-                  },
-                },
-              },
-            },
-          },
+          include: CONTACT_USER_INCLUDE,
         });
       }),
     );
 
     return upsertedContacts;
+  }
+
+  async addContact(ownerId: string, dto: AddContactDto) {
+    const targetUser = await this.prisma.user.findFirst({
+      where: {
+        phoneNumber: dto.phone_number,
+        id: { not: ownerId },
+        isActive: true,
+        isBanned: false,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+        displayName: true,
+      },
+    });
+
+    if (!targetUser) {
+      throw new NotFoundException(
+        `No registered WhatsApp Pro user found with phone number ${dto.phone_number}`,
+      );
+    }
+
+    const trimmedNickname = dto.nickname?.trim();
+
+    return this.prisma.contact.upsert({
+      where: {
+        ownerId_contactId: {
+          ownerId,
+          contactId: targetUser.id,
+        },
+      },
+      create: {
+        ownerId,
+        contactId: targetUser.id,
+        nickname: trimmedNickname || targetUser.displayName,
+      },
+      update: {
+        ...(trimmedNickname ? { nickname: trimmedNickname } : {}),
+      },
+      include: CONTACT_USER_INCLUDE,
+    });
+  }
+
+  async removeContact(ownerId: string, contactId: string) {
+    const result = await this.prisma.contact.deleteMany({
+      where: {
+        ownerId,
+        OR: [{ contactId }, { id: contactId }],
+      },
+    });
+
+    if (result.count === 0) {
+      throw new NotFoundException('Contact not found');
+    }
+
+    return { removed: true, contact_id: contactId };
   }
 
   async getContacts(ownerId: string) {
@@ -455,25 +514,7 @@ export class UsersService {
           deletedAt: null,
         },
       },
-      include: {
-        contactUser: {
-          select: {
-            id: true,
-            phoneNumber: true,
-            countryCode: true,
-            username: true,
-            displayName: true,
-            about: true,
-            avatarUrl: true,
-            profile: {
-              select: {
-                isOnline: true,
-                lastSeen: true,
-              },
-            },
-          },
-        },
-      },
+      include: CONTACT_USER_INCLUDE,
       orderBy: [{ isFavorite: 'desc' }, { createdAt: 'desc' }],
     });
   }

@@ -25,6 +25,8 @@ export class SyncContactItemDto {
   nickname?: string;
 }
 
+export class AddContactDto extends SyncContactItemDto {}
+
 export class SyncContactsDto {
   @ApiProperty({
     type: [SyncContactItemDto],

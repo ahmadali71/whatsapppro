@@ -21,7 +21,7 @@ import {
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { SearchUsersDto } from './dto/search-users.dto';
-import { SyncContactsDto } from './dto/sync-contacts.dto';
+import { AddContactDto, SyncContactsDto } from './dto/sync-contacts.dto';
 import { ChangeNumberDto, UpdateProfileDto } from './dto/update-profile.dto';
 import { UsersService } from './users.service';
 
@@ -136,6 +136,20 @@ export class UsersController {
     };
   }
 
+  @Post('contacts')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Add a single registered contact by phone number' })
+  @ApiResponse({ status: 201, description: 'Contact added successfully' })
+  @ApiResponse({ status: 404, description: 'Registered user not found for phone number' })
+  async addContact(@CurrentUser('id') userId: string, @Body() dto: AddContactDto) {
+    const data = await this.usersService.addContact(userId, dto);
+    return {
+      success: true,
+      data,
+      message: 'Contact added successfully',
+    };
+  }
+
   @Post('contacts/sync')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Batch sync device contacts with registered WhatsApp Pro users' })
@@ -158,6 +172,22 @@ export class UsersController {
       success: true,
       data,
       message: 'Contacts retrieved successfully',
+    };
+  }
+
+  @Delete('contacts/:contactId')
+  @ApiOperation({ summary: 'Remove a saved contact by contact user ID or record ID' })
+  @ApiParam({ name: 'contactId', description: 'Contact user ID or contact record ID' })
+  @ApiResponse({ status: 200, description: 'Contact removed successfully' })
+  async removeContact(
+    @CurrentUser('id') userId: string,
+    @Param('contactId') contactId: string,
+  ) {
+    const data = await this.usersService.removeContact(userId, contactId);
+    return {
+      success: true,
+      data,
+      message: 'Contact removed successfully',
     };
   }
 

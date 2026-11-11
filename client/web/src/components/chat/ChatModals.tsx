@@ -1,8 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Search,
   X,
   Users,
+  UserPlus,
+  Trash2,
+  Phone,
   MessageSquare,
   Star,
   Image as ImageIcon,
@@ -15,6 +18,7 @@ import {
 import { ConversationType, User } from '@whatsapp-pro/shared-types';
 import { ConversationWithMeta, LocalMessage, SearchResults, useChatStore } from '@/stores/chatStore';
 import { groupsApi, mediaApi } from '@/services/api.services';
+import { COUNTRIES } from '@/lib/countries';
 import { Avatar } from '@/components/common/Avatar';
 import { toast } from '@/stores/toastStore';
 
@@ -290,15 +294,47 @@ export const NewChatModal: React.FC<{
   open: boolean;
   onClose: () => void;
   onChatCreated: (conversationId: string) => void;
-}> = ({ open, onClose, onChatCreated }) => {
-  const { searchUsers, contacts, fetchContacts, syncContacts, createDirectChat } = useChatStore();
+  initialMode?: 'chat' | 'add_contact';
+}> = ({ open, onClose, onChatCreated, initialMode = 'chat' }) => {
+  const {
+    searchUsers,
+    contacts,
+    fetchContacts,
+    addContact,
+    removeContact,
+    syncContacts,
+    createDirectChat,
+  } = useChatStore();
+  const [mode, setMode] = useState<'chat' | 'add_contact' | 'sync'>(initialMode);
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<User[]>([]);
+  const [dialCode, setDialCode] = useState('+1');
+  const [phoneInput, setPhoneInput] = useState('');
+  const [nicknameInput, setNicknameInput] = useState('');
+  const [addError, setAddError] = useState('');
+  const [savingContact, setSavingContact] = useState(false);
   const [syncInput, setSyncInput] = useState('');
-  const [showSync, setShowSync] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [loading, setLoading] = useState(false);
 
+  useEffect(() => {
+    if (!open) return;
+    setMode(initialMode);
+    setAddError('');
+    void fetchContacts();
+  }, [open, initialMode, fetchContacts]);
+
   if (!open) return null;
+
+  const isSavedContact = (userId: string) =>
+    contacts.some((c) => c.contactId === userId || c.contactUser?.id === userId);
+
+  const normalizeE164 = (rawPhone: string): string => {
+    const cleaned = rawPhone.trim().replace(/[\s\-().]/g, '');
+    if (cleaned.startsWith('+')) return cleaned;
+    const digitsOnly = cleaned.replace(/\D/g, '');
+    return `${dialCode}${digitsOnly}`;
+  };
 
   const handleSearch = async (val: string) => {
     setQuery(val);
@@ -308,7 +344,7 @@ export const NewChatModal: React.FC<{
     }
     setLoading(true);
     try {
-      const users = await searchUsers(val.trim(), val.trim().startsWith('+') ? 'phone' : 'username');
+      const users = await searchUsers(val.trim());
       setResults(users);
     } catch {
       setResults([]);
@@ -327,6 +363,53 @@ export const NewChatModal: React.FC<{
     }
   };
 
+  const submitAddContact = async (startChatAfter: boolean) => {
+    setAddError('');
+    const e164 = normalizeE164(phoneInput);
+    if (!/^\+[1-9]\d{6,14}$/.test(e164)) {
+      const msg = 'Enter a valid phone number in international format (e.g. +15551234567).';
+      setAddError(msg);
+      return;
+    }
+
+    setSavingContact(true);
+    try {
+      const saved = await addContact(e164, nicknameInput.trim() || undefined);
+      setPhoneInput('');
+      setNicknameInput('');
+      toast.success('Contact added!');
+      if (startChatAfter) {
+        await startChat(saved.contactId);
+      } else {
+        setMode('chat');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to add contact';
+      setAddError(msg);
+      toast.error(msg);
+    } finally {
+      setSavingContact(false);
+    }
+  };
+
+  const handleQuickAdd = async (u: User) => {
+    try {
+      await addContact(u.phoneNumber, u.displayName);
+      toast.success(`Added ${u.displayName} to contacts`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to add contact');
+    }
+  };
+
+  const handleRemoveContact = async (contactId: string, label: string) => {
+    try {
+      await removeContact(contactId);
+      toast.success(`Removed ${label} from contacts`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to remove contact');
+    }
+  };
+
   const handleSync = async (e: React.FormEvent) => {
     e.preventDefault();
     const phones = syncInput
@@ -334,51 +417,169 @@ export const NewChatModal: React.FC<{
       .map((s) => s.trim())
       .filter(Boolean);
     if (phones.length === 0) return;
+    setSyncing(true);
     try {
-      await syncContacts(phones);
-      await fetchContacts();
-      setShowSync(false);
+      const synced = await syncContacts(phones);
       setSyncInput('');
-      toast.success('Contacts synced!');
-    } catch {
-      toast.error('Failed to sync contacts');
+      setMode('chat');
+      if (synced.length === 0) {
+        toast.warning('No registered WhatsApp Pro users matched those phone numbers.');
+      } else {
+        toast.success(`Synced ${synced.length} contact${synced.length === 1 ? '' : 's'}!`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to sync contacts');
+    } finally {
+      setSyncing(false);
     }
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="bg-white dark:bg-[#202c33] rounded-2xl max-w-md w-full shadow-xl border border-gray-200 dark:border-[#2a3942] overflow-hidden flex flex-col max-h-[80vh]">
-        <div className="p-4 border-b border-gray-200 dark:border-[#2a3942] flex items-center justify-between">
-          <h3 className="font-semibold text-base">New Chat</h3>
+      <div className="bg-white dark:bg-[#202c33] rounded-2xl max-w-md w-full shadow-xl border border-gray-200 dark:border-[#2a3942] overflow-hidden flex flex-col max-h-[85vh]">
+        <div className="p-4 border-b border-gray-200 dark:border-[#2a3942] flex items-center justify-between gap-2">
+          <h3 className="font-semibold text-base">Contacts & New Chat</h3>
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => setShowSync((s) => !s)}
-              className="text-xs text-[#00A884] font-semibold flex items-center gap-1"
+              onClick={() => {
+                setAddError('');
+                setMode((m) => (m === 'add_contact' ? 'chat' : 'add_contact'));
+              }}
+              className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1 transition ${
+                mode === 'add_contact'
+                  ? 'bg-[#00A884] text-white'
+                  : 'bg-[#00A884]/15 text-[#00A884] hover:bg-[#00A884]/25'
+              }`}
+            >
+              <UserPlus className="w-3.5 h-3.5" /> Add Contact
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode((m) => (m === 'sync' ? 'chat' : 'sync'))}
+              className={`px-2 py-1 rounded-lg text-xs font-semibold flex items-center gap-1 transition ${
+                mode === 'sync'
+                  ? 'bg-gray-200 dark:bg-[#2a3942] text-[#111b21] dark:text-[#e9edef]'
+                  : 'text-[#667781] hover:bg-gray-100 dark:hover:bg-[#2a3942]'
+              }`}
+              title="Bulk Sync Phone Numbers"
             >
               <RefreshCw className="w-3.5 h-3.5" /> Sync
             </button>
-            <button type="button" onClick={onClose}>
+            <button type="button" onClick={onClose} aria-label="Close">
               <X className="w-5 h-5 text-gray-400" />
             </button>
           </div>
         </div>
 
-        {showSync && (
+        {mode === 'add_contact' && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submitAddContact(false);
+            }}
+            className="p-4 bg-gray-50 dark:bg-[#111b21] border-b border-gray-200 dark:border-[#2a3942] space-y-3"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold uppercase tracking-wide text-[#00A884] flex items-center gap-1.5">
+                <Phone className="w-3.5 h-3.5" /> Add Contact by Phone
+              </span>
+              <button
+                type="button"
+                onClick={() => setMode('chat')}
+                className="text-xs text-[#667781] hover:underline"
+              >
+                Cancel
+              </button>
+            </div>
+
+            <div className="flex gap-2">
+              <select
+                value={dialCode}
+                onChange={(e) => setDialCode(e.target.value)}
+                aria-label="Country code"
+                className="w-28 px-2 py-2 rounded-xl bg-white dark:bg-[#202c33] border border-gray-300 dark:border-[#2a3942] text-xs focus:outline-none focus:border-[#00A884]"
+              >
+                {COUNTRIES.map((c) => (
+                  <option key={c.code} value={c.dialCode}>
+                    {c.flag} {c.dialCode}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="tel"
+                value={phoneInput}
+                onChange={(e) => {
+                  setPhoneInput(e.target.value);
+                  if (addError) setAddError('');
+                }}
+                placeholder="Phone digits or +15551234567"
+                className="flex-1 px-3 py-2 rounded-xl bg-white dark:bg-[#202c33] border border-gray-300 dark:border-[#2a3942] text-sm focus:outline-none focus:border-[#00A884]"
+                autoFocus
+                required
+              />
+            </div>
+
+            <input
+              type="text"
+              value={nicknameInput}
+              onChange={(e) => setNicknameInput(e.target.value)}
+              placeholder="Contact name / nickname (optional)"
+              maxLength={100}
+              className="w-full px-3 py-2 rounded-xl bg-white dark:bg-[#202c33] border border-gray-300 dark:border-[#2a3942] text-sm focus:outline-none focus:border-[#00A884]"
+            />
+
+            {addError && (
+              <p className="text-xs text-red-500 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+                {addError}
+              </p>
+            )}
+
+            <div className="flex items-center gap-2">
+              <button
+                type="submit"
+                disabled={savingContact}
+                className="flex-1 py-2 rounded-xl border border-[#00A884] text-[#00A884] hover:bg-[#00A884]/10 text-xs font-semibold disabled:opacity-50 transition"
+              >
+                {savingContact ? 'Saving...' : 'Save Contact'}
+              </button>
+              <button
+                type="button"
+                disabled={savingContact}
+                onClick={() => void submitAddContact(true)}
+                className="flex-1 py-2 rounded-xl bg-[#00A884] hover:bg-[#008f6f] text-white text-xs font-semibold disabled:opacity-50 transition"
+              >
+                {savingContact ? 'Saving...' : 'Save & Start Chat'}
+              </button>
+            </div>
+          </form>
+        )}
+
+        {mode === 'sync' && (
           <form onSubmit={handleSync} className="p-4 bg-gray-50 dark:bg-[#111b21] border-b border-gray-200 dark:border-[#2a3942] space-y-2">
             <textarea
               rows={2}
               value={syncInput}
               onChange={(e) => setSyncInput(e.target.value)}
-              placeholder="Enter phone numbers separated by comma or newline (+15551234567, ...)"
+              placeholder="Bulk sync E.164 phone numbers separated by comma or newline (+15551234567, ...)"
               className="w-full p-2 rounded-lg bg-white dark:bg-[#202c33] border border-gray-300 dark:border-[#2a3942] text-xs"
             />
-            <button
-              type="submit"
-              className="px-3 py-1.5 rounded-lg bg-[#00A884] text-white text-xs font-semibold"
-            >
-              Sync Contacts
-            </button>
+            <div className="flex items-center justify-between gap-2">
+              <button
+                type="submit"
+                disabled={syncing}
+                className="px-3 py-1.5 rounded-lg bg-[#00A884] text-white text-xs font-semibold disabled:opacity-50"
+              >
+                {syncing ? 'Syncing...' : 'Sync Numbers'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode('chat')}
+                className="text-xs text-[#667781] hover:underline"
+              >
+                Cancel
+              </button>
+            </div>
           </form>
         )}
 
@@ -389,14 +590,25 @@ export const NewChatModal: React.FC<{
               type="text"
               value={query}
               onChange={(e) => void handleSearch(e.target.value)}
-              placeholder="Search username or +phone number..."
+              placeholder="Search by name, @username, or phone..."
               className="flex-1 bg-transparent text-sm focus:outline-none"
-              autoFocus
+              autoFocus={mode === 'chat'}
             />
+            {query && (
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery('');
+                  setResults([]);
+                }}
+              >
+                <X className="w-4 h-4 text-gray-400" />
+              </button>
+            )}
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+        <div className="flex-1 overflow-y-auto p-2 space-y-2">
           {loading && <p className="text-xs text-center py-4 text-[#667781]">Searching...</p>}
 
           {results.length > 0 && (
@@ -404,24 +616,51 @@ export const NewChatModal: React.FC<{
               <p className="px-2 py-1 text-[11px] font-semibold uppercase text-[#667781]">
                 Search Results
               </p>
-              {results.map((u) => (
-                <button
-                  key={u.id}
-                  type="button"
-                  onClick={() => void startChat(u.id)}
-                  className="w-full flex items-center gap-3 p-2.5 rounded-xl hover:bg-gray-100 dark:hover:bg-[#2a3942] text-left"
-                >
-                  <Avatar src={u.avatarUrl} name={u.displayName} size="sm" />
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium truncate">{u.displayName}</p>
-                    <p className="text-xs text-[#667781] truncate">
-                      {u.username ? `@${u.username} · ` : ''}
-                      {u.phoneNumber}
-                    </p>
+              {results.map((u) => {
+                const saved = isSavedContact(u.id);
+                return (
+                  <div
+                    key={u.id}
+                    className="w-full flex items-center gap-2 p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-[#2a3942]"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => void startChat(u.id)}
+                      className="flex-1 min-w-0 flex items-center gap-3 text-left"
+                    >
+                      <Avatar src={u.avatarUrl} name={u.displayName} size="sm" />
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium truncate">{u.displayName}</p>
+                        <p className="text-xs text-[#667781] truncate">
+                          {u.username ? `@${u.username} · ` : ''}
+                          {u.phoneNumber}
+                        </p>
+                      </div>
+                    </button>
+                    {saved ? (
+                      <span className="px-2 py-1 rounded-lg bg-[#00A884]/10 text-[#00A884] text-[11px] font-medium shrink-0">
+                        Saved
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => void handleQuickAdd(u)}
+                        className="px-2.5 py-1 rounded-lg bg-[#00A884]/15 hover:bg-[#00A884]/25 text-[#00A884] text-xs font-semibold flex items-center gap-1 shrink-0"
+                        title="Save to Contacts"
+                      >
+                        <UserPlus className="w-3.5 h-3.5" /> Add
+                      </button>
+                    )}
                   </div>
-                </button>
-              ))}
+                );
+              })}
             </div>
+          )}
+
+          {!loading && query.trim().length >= 2 && results.length === 0 && (
+            <p className="text-xs text-[#667781] text-center py-3">
+              No users matched "{query.trim()}". Try adding them directly by phone number.
+            </p>
           )}
 
           <div>
@@ -429,30 +668,55 @@ export const NewChatModal: React.FC<{
               Your Contacts ({contacts.length})
             </p>
             {contacts.length === 0 ? (
-              <p className="text-xs text-[#667781] text-center py-6">
-                Search for a user above or sync phone contacts to start chatting.
-              </p>
+              <div className="text-xs text-[#667781] text-center py-6 space-y-2">
+                <p>No saved contacts yet. Add a contact by phone or search registered users above.</p>
+                {mode !== 'add_contact' && (
+                  <button
+                    type="button"
+                    onClick={() => setMode('add_contact')}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#00A884]/15 text-[#00A884] font-semibold"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" /> Add First Contact
+                  </button>
+                )}
+              </div>
             ) : (
-              contacts.map((c) => (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => void startChat(c.contactId)}
-                  className="w-full flex items-center gap-3 p-2.5 rounded-xl hover:bg-gray-100 dark:hover:bg-[#2a3942] text-left"
-                >
-                  <Avatar
-                    src={c.contactUser?.avatarUrl}
-                    name={c.nickname || c.contactUser?.displayName || 'Contact'}
-                    size="sm"
-                  />
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium truncate">
-                      {c.nickname || c.contactUser?.displayName || c.contactId}
-                    </p>
-                    <p className="text-xs text-[#667781] truncate">{c.contactUser?.about}</p>
+              contacts.map((c) => {
+                const label = c.nickname || c.contactUser?.displayName || c.contactId;
+                return (
+                  <div
+                    key={c.id}
+                    className="w-full flex items-center gap-2 p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-[#2a3942] group"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => void startChat(c.contactId)}
+                      className="flex-1 min-w-0 flex items-center gap-3 text-left"
+                    >
+                      <Avatar
+                        src={c.contactUser?.avatarUrl}
+                        name={label}
+                        size="sm"
+                      />
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium truncate">{label}</p>
+                        <p className="text-xs text-[#667781] truncate">
+                          {c.contactUser?.phoneNumber || c.contactUser?.about || ''}
+                        </p>
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleRemoveContact(c.contactId, label)}
+                      className="p-1.5 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-500/10 opacity-70 group-hover:opacity-100 transition shrink-0"
+                      title="Remove contact"
+                      aria-label={`Remove ${label}`}
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
-                </button>
-              ))
+                );
+              })
             )}
           </div>
         </div>
@@ -466,7 +730,7 @@ export const CreateGroupModal: React.FC<{
   onClose: () => void;
   onGroupCreated: (conversationId?: string) => void;
 }> = ({ open, onClose, onGroupCreated }) => {
-  const { contacts, searchUsers, fetchConversations } = useChatStore();
+  const { contacts, searchUsers, fetchContacts, fetchConversations } = useChatStore();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [avatarUrl, setAvatarUrl] = useState('');
@@ -474,6 +738,12 @@ export const CreateGroupModal: React.FC<{
   const [searchQ, setSearchQ] = useState('');
   const [searchRes, setSearchRes] = useState<User[]>([]);
   const [creating, setCreating] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      void fetchContacts();
+    }
+  }, [open, fetchContacts]);
 
   if (!open) return null;
 
@@ -490,7 +760,7 @@ export const CreateGroupModal: React.FC<{
       return;
     }
     try {
-      const res = await searchUsers(q.trim(), q.trim().startsWith('+') ? 'phone' : 'username');
+      const res = await searchUsers(q.trim());
       setSearchRes(res);
     } catch {
       setSearchRes([]);

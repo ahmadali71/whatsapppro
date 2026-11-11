@@ -4,6 +4,7 @@ import {
   Search,
   MessageSquarePlus,
   Users,
+  UserPlus,
   Phone,
   Video,
   Info,
@@ -28,6 +29,7 @@ import { useAuthStore } from '@/stores/authStore';
 import { ConversationWithMeta, LocalMessage, useChatStore } from '@/stores/chatStore';
 import { useCallStore } from '@/stores/callStore';
 import { useThemeStore, WALLPAPER_PRESETS } from '@/stores/themeStore';
+import { socketManager } from '@/lib/socket';
 import { Avatar } from '@/components/common/Avatar';
 import { MessageBubble } from '@/components/chat/MessageBubble';
 import { MessageComposer } from '@/components/chat/MessageComposer';
@@ -130,7 +132,9 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
   // Modals
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
+  const [newChatMode, setNewChatMode] = useState<'chat' | 'add_contact'>('chat');
   const [createGroupOpen, setCreateGroupOpen] = useState(false);
+  const [socketConnected, setSocketConnected] = useState(socketManager.isConnected);
   const [forwardingMsg, setForwardingMsg] = useState<LocalMessage | null>(null);
   const [infoMsg, setInfoMsg] = useState<LocalMessage | null>(null);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
@@ -138,6 +142,26 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const currentUserId = user?.id || '';
+
+  const openContactsModal = (mode: 'chat' | 'add_contact' = 'chat') => {
+    setNewChatMode(mode);
+    setNewChatOpen(true);
+  };
+
+  useEffect(() => socketManager.onConnectionChange(setSocketConnected), []);
+
+  // Lightweight HTTP polling when WebSocket is unavailable (e.g. serverless deployment)
+  useEffect(() => {
+    if (socketConnected) return;
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      void fetchConversations();
+      if (activeConversationId) {
+        void fetchMessages(activeConversationId);
+      }
+    }, 10000);
+    return () => window.clearInterval(interval);
+  }, [socketConnected, activeConversationId, fetchConversations, fetchMessages]);
 
   useEffect(() => {
     setFilterTab(initialFilter);
@@ -286,6 +310,14 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
             </button>
             <button
               type="button"
+              onClick={() => openContactsModal('add_contact')}
+              className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-[#2a3942] text-[#00A884]"
+              title="Add Contact"
+            >
+              <UserPlus className="w-5 h-5" />
+            </button>
+            <button
+              type="button"
               onClick={() => setCreateGroupOpen(true)}
               className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-[#2a3942] text-[#54656f] dark:text-[#aebac1]"
               title="Create Group"
@@ -294,7 +326,7 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
             </button>
             <button
               type="button"
-              onClick={() => setNewChatOpen(true)}
+              onClick={() => openContactsModal('chat')}
               className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-[#2a3942] text-[#00A884]"
               title="New Chat"
             >
@@ -746,11 +778,19 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
           <p className="text-sm text-[#667781] dark:text-[#8696a0] max-w-md mb-6">
             Select a conversation or start a new chat. All private 1:1 chats are protected with client-side Signal Protocol end-to-end encryption.
           </p>
-          <div className="flex gap-3">
+          <div className="flex flex-wrap justify-center gap-3">
             <button
               type="button"
-              onClick={() => setNewChatOpen(true)}
-              className="px-5 py-2.5 rounded-full bg-[#00A884] hover:bg-[#008f6f] text-white text-sm font-medium transition"
+              onClick={() => openContactsModal('add_contact')}
+              className="px-5 py-2.5 rounded-full bg-[#00A884] hover:bg-[#008f6f] text-white text-sm font-medium transition inline-flex items-center gap-2"
+            >
+              <UserPlus className="w-4 h-4" />
+              Add Contact
+            </button>
+            <button
+              type="button"
+              onClick={() => openContactsModal('chat')}
+              className="px-5 py-2.5 rounded-full border border-[#00A884] text-[#00A884] hover:bg-[#00A884]/10 text-sm font-medium transition"
             >
               Start New Chat
             </button>
@@ -783,6 +823,7 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
       />
       <NewChatModal
         open={newChatOpen}
+        initialMode={newChatMode}
         onClose={() => setNewChatOpen(false)}
         onChatCreated={handleSelectConversation}
       />

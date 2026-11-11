@@ -37,14 +37,17 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
   const { resolvedTheme, setTheme } = useThemeStore();
 
   const [socketConnected, setSocketConnected] = useState(socketManager.isConnected);
+  const [httpFallback, setHttpFallback] = useState(socketManager.isHttpFallback);
   const [pinInput, setPinInput] = useState('');
 
   useEffect(() => {
     const unsubConn = socketManager.onConnectionChange(setSocketConnected);
+    const unsubFallback = socketManager.onFallbackChange(setHttpFallback);
     const unsubChat = initSocketListeners();
     const unsubCall = initCallSocketListeners();
     return () => {
       unsubConn();
+      unsubFallback();
       unsubChat();
       unsubCall();
     };
@@ -166,7 +169,18 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
 
         <div className="flex flex-col items-center gap-3">
           {!socketConnected && (
-            <div title="Reconnecting to real-time server..." className="text-amber-500 animate-pulse">
+            <div
+              title={
+                httpFallback
+                  ? 'HTTP sync active (live WebSocket unavailable)'
+                  : 'Reconnecting to real-time server...'
+              }
+              className={
+                httpFallback
+                  ? 'text-[#667781] dark:text-[#8696a0]'
+                  : 'text-amber-500 animate-pulse'
+              }
+            >
               <WifiOff className="w-4 h-4" />
             </div>
           )}

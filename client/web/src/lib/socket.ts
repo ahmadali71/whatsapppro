@@ -17,10 +17,17 @@ class SocketManager {
   private offlineQueue: QueuedAction[] = [];
   private listeners = new Map<string, Set<EventCallback<unknown>>>();
   private connectionStateListeners = new Set<(connected: boolean) => void>();
+  private fallbackStateListeners = new Set<(fallback: boolean) => void>();
   private _isConnected = false;
+  private _httpFallback = false;
+  private consecutiveFailures = 0;
 
   get isConnected(): boolean {
     return this._isConnected;
+  }
+
+  get isHttpFallback(): boolean {
+    return this._httpFallback;
   }
 
   connect(tokenOverride?: string): Socket {
@@ -32,6 +39,10 @@ class SocketManager {
       this.socket.disconnect();
     }
 
+    this.consecutiveFailures = 0;
+    this._httpFallback = false;
+    this.notifyFallbackState(false);
+
     this.socket = io(SOCKET_URL, {
       auth: {
         token: token ? `Bearer ${token}` : undefined,
@@ -39,12 +50,15 @@ class SocketManager {
       },
       transports: ['websocket', 'polling'],
       reconnection: true,
-      reconnectionAttempts: Infinity,
+      reconnectionAttempts: 2,
       reconnectionDelay: 1000,
-      reconnectionDelayMax: 10000,
+      reconnectionDelayMax: 5000,
     });
 
     this.socket.on(SocketEvents.CONNECT, () => {
+      this.consecutiveFailures = 0;
+      this._httpFallback = false;
+      this.notifyFallbackState(false);
       this._isConnected = true;
       this.notifyConnectionState(true);
       if (token) {
@@ -60,8 +74,14 @@ class SocketManager {
     });
 
     this.socket.on(SocketEvents.CONNECT_ERROR, () => {
+      this.consecutiveFailures += 1;
       this._isConnected = false;
       this.notifyConnectionState(false);
+      if (this.consecutiveFailures >= 2) {
+        this._httpFallback = true;
+        this.notifyFallbackState(true);
+        this.socket?.disconnect();
+      }
     });
 
     // Attach any already-registered event listeners
@@ -80,6 +100,9 @@ class SocketManager {
       this.socket.disconnect();
       this.socket = null;
     }
+    this.consecutiveFailures = 0;
+    this._httpFallback = false;
+    this.notifyFallbackState(false);
     this._isConnected = false;
     this.notifyConnectionState(false);
   }
@@ -119,8 +142,20 @@ class SocketManager {
     };
   }
 
+  onFallbackChange(cb: (fallback: boolean) => void): () => void {
+    this.fallbackStateListeners.add(cb);
+    cb(this._httpFallback);
+    return () => {
+      this.fallbackStateListeners.delete(cb);
+    };
+  }
+
   private notifyConnectionState(connected: boolean) {
     this.connectionStateListeners.forEach((cb) => cb(connected));
+  }
+
+  private notifyFallbackState(fallback: boolean) {
+    this.fallbackStateListeners.forEach((cb) => cb(fallback));
   }
 
   private flushOfflineQueue() {
