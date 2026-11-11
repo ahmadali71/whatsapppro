@@ -19,8 +19,7 @@
     "db:studio": "npm run prisma:studio --workspace=server",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",
-    "docker:logs": "docker-compose logs -f",
-    "prepare": "husky install"
+    "docker:logs": "docker-compose logs -f"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",

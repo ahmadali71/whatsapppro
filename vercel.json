@@ -1,0 +1,8 @@
+{
+  "installCommand": "npm --prefix client/web install",
+  "buildCommand": "npm --prefix client/web run build",
+  "outputDirectory": "client/web/dist",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
