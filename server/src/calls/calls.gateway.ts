@@ -12,6 +12,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { Server, Socket } from 'socket.io';
 import { CallsService } from './calls.service';
+import { createCorsOriginOption } from '../common/cors.util';
 import {
   CallActionPayload,
   CallAnswerPayload,
@@ -36,7 +37,7 @@ interface JwtSocketPayload {
  */
 @WebSocketGateway({
   cors: {
-    origin: '*',
+    origin: createCorsOriginOption(),
     credentials: true,
   },
   namespace: '/',

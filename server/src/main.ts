@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { createCorsOriginOption } from './common/cors.util';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -15,14 +16,9 @@ async function bootstrap() {
 
   const configService = app.get(ConfigService);
   const port = configService.get<number>('PORT', 3001);
-  const corsOriginsRaw = configService.get<string>('CORS_ORIGINS', 'http://localhost:3000').trim();
-  const corsOrigin: boolean | string[] =
-    corsOriginsRaw === '*'
-      ? true
-      : corsOriginsRaw
-          .split(',')
-          .map((origin) => origin.trim())
-          .filter(Boolean);
+  const corsOriginsRaw = configService.get<string>('CORS_ORIGINS');
+  const frontendUrl = configService.get<string>('FRONTEND_URL');
+  const corsOrigin = createCorsOriginOption(corsOriginsRaw, frontendUrl);
 
   // Security headers (allow cross-origin media embedding & Swagger/SPA assets)
   app.use(

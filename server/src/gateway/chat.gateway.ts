@@ -18,6 +18,7 @@ import { SocketEvents } from '../shared-types';
 import { GatewayService } from './gateway.service';
 import { ChatsService } from '../chats/chats.service';
 import { CreateMessageDto } from '../chats/dto/create-message.dto';
+import { createCorsOriginOption } from '../common/cors.util';
 
 interface JwtPayload {
   sub?: string;
@@ -83,7 +84,7 @@ interface LiveLocationPayload {
 
 @WebSocketGateway({
   cors: {
-    origin: '*',
+    origin: createCorsOriginOption(),
     credentials: true,
   },
   namespace: '/',
