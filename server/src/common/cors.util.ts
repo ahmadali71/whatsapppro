@@ -1,6 +1,9 @@
 const DEFAULT_CORS_ORIGINS =
-  'https://web-9b56.vercel.app,http://localhost:3000,http://localhost:3001';
-const ALWAYS_ALLOWED_ORIGINS = ['https://web-9b56.vercel.app'];
+  'https://whatsapppro-web.vercel.app,https://web-9b56.vercel.app,http://localhost:3000,http://localhost:3001';
+const ALWAYS_ALLOWED_ORIGINS = [
+  'https://whatsapppro-web.vercel.app',
+  'https://web-9b56.vercel.app',
+];
 const VERCEL_ORIGIN_ENV_KEYS = [
   'VERCEL_URL',
   'VERCEL_BRANCH_URL',
