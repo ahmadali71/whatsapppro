@@ -26,4 +26,9 @@ export class PaginateDto {
   @IsOptional()
   @IsString()
   search?: string;
+
+  @ApiPropertyOptional({ description: 'Message content search query string' })
+  @IsOptional()
+  @IsString()
+  q?: string;
 }

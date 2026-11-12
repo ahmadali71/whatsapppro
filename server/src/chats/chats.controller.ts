@@ -135,7 +135,6 @@ export class ChatsController {
     @Req() req: AuthenticatedRequest,
     @Param('id', ParseUUIDPipe) conversationId: string,
     @Query() query: PaginateDto,
-    @Query('q') q?: string,
   ) {
     const userId = this.getUserId(req);
     return this.chatsService.getMessages(
@@ -143,7 +142,7 @@ export class ChatsController {
       userId,
       query.cursor,
       query.limit,
-      q,
+      query.q ?? query.search,
     );
   }
 
