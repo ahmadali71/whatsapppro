@@ -350,6 +350,30 @@ export const StatusPage: React.FC = () => {
             </div>
           </div>
 
+          {myStatuses.length === 0 && (
+            <div className="mx-2 p-3 rounded-2xl border border-dashed border-[#00A884]/40 bg-[#00A884]/5 flex items-center justify-between gap-2">
+              <span className="text-xs text-[#54656f] dark:text-[#aebac1]">
+                Share a photo or text update for 24h
+              </span>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setMediaModalOpen(true)}
+                  className="px-2.5 py-1 rounded-lg bg-[#00A884] text-white text-[11px] font-semibold"
+                >
+                  Photo
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTextModalOpen(true)}
+                  className="px-2.5 py-1 rounded-lg bg-white dark:bg-[#2a3942] border border-gray-200 dark:border-[#3b4a54] text-[11px] font-semibold"
+                >
+                  Text
+                </button>
+              </div>
+            </div>
+          )}
+
           <div className="px-2">
             <p className="text-xs font-semibold uppercase tracking-wider text-[#00A884] mb-2">
               Recent Updates

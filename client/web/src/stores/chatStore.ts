@@ -1151,6 +1151,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (convMissing) {
         void get().fetchConversations();
       }
+
+      if (dec.senderId !== currentUserId) {
+        import('@/lib/pushNotifications').then(({ showPushNotification }) => {
+          const senderName = dec.sender?.displayName || 'New Message';
+          const preview = (dec.decryptedContent || dec.content || dec.messageType || '').slice(0, 60);
+          showPushNotification(senderName, preview, dec.sender?.avatarUrl || undefined);
+        }).catch(() => {});
+      }
     };
 
     const handleMessageUpdated = async (rawMsg: Message) => {

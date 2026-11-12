@@ -189,9 +189,11 @@ api.interceptors.response.use(
       isRefreshing = true;
 
       try {
-        const res = await axios.post(`${API_BASE_URL}/auth/refresh`, {
-          refresh_token: refreshToken,
-        });
+        const res = await axios.post(
+          `${API_BASE_URL}/auth/refresh`,
+          { refresh_token: refreshToken },
+          { timeout: 15000 },
+        );
         const payload = unwrapData<{
           accessToken?: string;
           refreshToken?: string;

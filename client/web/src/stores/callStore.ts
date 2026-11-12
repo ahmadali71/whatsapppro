@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { Call, CallStatus, CallType, SocketEvents, User } from '@whatsapp-pro/shared-types';
-import { api, extractErrorMessage, unwrapData } from '@/lib/api';
+import { api, extractErrorMessage, getStoredTokens, unwrapData } from '@/lib/api';
 import { socketManager } from '@/lib/socket';
 import { ConnectionQualityStats, webrtcManager } from '@/lib/webrtc';
 import { callsApi } from '@/services/api.services';
@@ -730,8 +730,9 @@ export const useCallStore = create<CallState>((set, get) => ({
 
     const pollIncoming = async () => {
       if (cancelled || incomingBusy || socketManager.isConnected || get().activeCall) return;
-      const currentUserId = useAuthStore.getState().user?.id;
-      if (!currentUserId) return;
+      const auth = useAuthStore.getState();
+      const currentUserId = auth.user?.id;
+      if (!auth.isAuthenticated || !currentUserId || !getStoredTokens().accessToken) return;
 
       incomingBusy = true;
       try {

@@ -182,6 +182,7 @@ export class ChatsService {
     return {
       items: items.map((m) => ({
         ...m.conversation,
+        unreadCount: m.unreadCount,
         isArchived: archivedIds.has(m.conversationId),
         membership: {
           id: m.id,
@@ -258,7 +259,7 @@ export class ChatsService {
       } catch (error) {
         this.logger.warn(`Non-fatal socket join error: ${(error as Error).message}`);
       }
-      return existing;
+      return { ...existing, unreadCount: 0 };
     }
 
     const created = await this.prisma.conversation.create({
@@ -301,7 +302,7 @@ export class ChatsService {
       this.logger.warn(`Non-fatal socket notify error: ${(error as Error).message}`);
     }
 
-    return created;
+    return { ...created, unreadCount: 0 };
   }
 
   async getConversationDetails(conversationId: string, userId: string) {
@@ -379,6 +380,7 @@ export class ChatsService {
     userId: string,
     cursor?: string,
     limit = 20,
+    q?: string,
   ) {
     await this.assertMember(conversationId, userId);
     const take = Math.min(limit, 100);
@@ -401,6 +403,7 @@ export class ChatsService {
       where: {
         conversationId,
         ...(deletedForMeIds.length > 0 ? { id: { notIn: deletedForMeIds } } : {}),
+        ...(q ? { content: { contains: q, mode: 'insensitive' as const } } : {}),
       },
       take: take + 1,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
@@ -1419,6 +1422,22 @@ export class ChatsService {
       pending,
       receipts,
     };
+  }
+
+  // ─────────────────────────── Typing Indicator (REST fallback) ────────────
+
+  async sendTypingEvent(userId: string, conversationId: string, isTyping: boolean) {
+    await this.assertMember(conversationId, userId);
+    try {
+      this.gatewayService.broadcastToConversation(
+        conversationId,
+        isTyping ? 'typing_start' : 'typing_stop',
+        { userId, conversationId },
+      );
+    } catch {
+      // Non-fatal: gateway may not be available in serverless mode
+    }
+    return { ok: true };
   }
 
   // ─────────────────────────── Link Preview (SSRF-safe) ────────────────────

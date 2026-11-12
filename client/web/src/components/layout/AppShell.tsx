@@ -54,6 +54,21 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
   }, [initSocketListeners, initCallSocketListeners]);
 
   useEffect(() => {
+    void import('@/lib/pushNotifications').then(m => m.requestNotificationPermission());
+  }, []);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        navigate('/?search=1');
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [navigate]);
+
+  useEffect(() => {
     if (!user?.id || socketConnected) return;
     return initCallHttpPolling();
   }, [user?.id, socketConnected, initCallHttpPolling]);

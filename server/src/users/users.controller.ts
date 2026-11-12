@@ -56,6 +56,17 @@ export class UsersController {
     };
   }
 
+  @Post('presence')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Update user online/offline presence status (serverless REST fallback)' })
+  @ApiResponse({ status: 200, description: 'Presence updated' })
+  async updatePresence(
+    @CurrentUser('id') userId: string,
+    @Body('isOnline') isOnline: boolean,
+  ) {
+    return this.usersService.updatePresence(userId, isOnline);
+  }
+
   @Delete('me')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Delete (soft-deactivate) current user account' })

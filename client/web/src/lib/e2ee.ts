@@ -25,7 +25,17 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 }
 
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
-  const binary = atob(base64);
+  if (typeof base64 !== 'string' || !base64.trim()) {
+    throw new Error('Invalid base64 key input');
+  }
+  const normalized = base64
+    .trim()
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .replace(/\s+/g, '');
+  const padLen = (4 - (normalized.length % 4)) % 4;
+  const padded = normalized + '='.repeat(padLen);
+  const binary = atob(padded);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
@@ -251,9 +261,15 @@ export interface RemoteKeyBundle {
   deviceId: string | number;
   registrationId: number;
   identityKey: string;
-  signedPreKeyId: number;
-  signedPreKey: string;
-  signedPreKeySignature: string;
+  signedPreKeyId?: number;
+  signedPreKey:
+    | string
+    | {
+        keyId: number;
+        publicKey: string;
+        signature: string;
+      };
+  signedPreKeySignature?: string;
   oneTimePreKey?: {
     keyId: number;
     publicKey: string;
@@ -334,21 +350,35 @@ class E2EEManager {
     const res = await api.get(`/keys/bundle/${recipientUserId}`);
     const bundle = unwrapData<RemoteKeyBundle>(res.data);
 
+    const signedKeyId =
+      typeof bundle.signedPreKey === 'object' && bundle.signedPreKey !== null
+        ? bundle.signedPreKey.keyId
+        : bundle.signedPreKeyId ?? 1;
+    const signedPublicKey =
+      typeof bundle.signedPreKey === 'object' && bundle.signedPreKey !== null
+        ? bundle.signedPreKey.publicKey
+        : bundle.signedPreKey;
+    const signedSignature =
+      typeof bundle.signedPreKey === 'object' && bundle.signedPreKey !== null
+        ? bundle.signedPreKey.signature
+        : bundle.signedPreKeySignature || '';
+
     const builder = new SessionBuilder(this.store, address);
     await builder.processPreKey({
       registrationId: bundle.registrationId,
       identityKey: base64ToArrayBuffer(bundle.identityKey),
       signedPreKey: {
-        keyId: bundle.signedPreKeyId,
-        publicKey: base64ToArrayBuffer(bundle.signedPreKey),
-        signature: base64ToArrayBuffer(bundle.signedPreKeySignature),
+        keyId: signedKeyId,
+        publicKey: base64ToArrayBuffer(signedPublicKey),
+        signature: base64ToArrayBuffer(signedSignature),
       } as SignedPublicPreKeyType,
-      preKey: bundle.oneTimePreKey
-        ? ({
-            keyId: bundle.oneTimePreKey.keyId,
-            publicKey: base64ToArrayBuffer(bundle.oneTimePreKey.publicKey),
-          } as PreKeyType)
-        : undefined,
+      preKey:
+        bundle.oneTimePreKey && bundle.oneTimePreKey.publicKey
+          ? ({
+              keyId: bundle.oneTimePreKey.keyId,
+              publicKey: base64ToArrayBuffer(bundle.oneTimePreKey.publicKey),
+            } as PreKeyType)
+          : undefined,
     });
 
     return address;

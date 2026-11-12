@@ -20,6 +20,7 @@ import {
   Sun,
   Moon,
   Loader2,
+  Keyboard,
 } from 'lucide-react';
 import {
   FontSize,
@@ -43,7 +44,14 @@ import { ConfirmModal } from '@/components/common/ConfirmModal';
 import { ImageCropModal } from '@/components/common/ImageCropModal';
 import { toast } from '@/stores/toastStore';
 
-type SettingsTab = 'account' | 'privacy' | 'chats' | 'notifications' | 'storage' | 'appearance';
+type SettingsTab =
+  | 'account'
+  | 'privacy'
+  | 'chats'
+  | 'notifications'
+  | 'storage'
+  | 'appearance'
+  | 'keyboard';
 
 function fmtBytes(bytes: number): string {
   if (!bytes) return '0 B';
@@ -268,6 +276,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTab }> = ({
     { id: 'notifications', label: 'Notifications', icon: Bell },
     { id: 'storage', label: 'Storage & Data', icon: HardDrive },
     { id: 'appearance', label: 'Appearance', icon: Palette },
+    { id: 'keyboard', label: 'Keyboard Shortcuts', icon: Keyboard },
   ];
 
   return (
@@ -912,6 +921,33 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTab }> = ({
                     </button>
                   );
                 })}
+              </div>
+            </div>
+          )}
+
+          {/* KEYBOARD SHORTCUTS TAB */}
+          {activeTab === 'keyboard' && (
+            <div className="bg-white dark:bg-[#202c33] rounded-2xl p-6 shadow-sm border border-gray-200/70 dark:border-[#2a3942]">
+              <h2 className="text-base font-bold mb-1">Keyboard Shortcuts</h2>
+              <p className="text-xs text-[#667781] dark:text-[#8696a0] mb-4">
+                Navigate and reply faster using keyboard shortcuts on WhatsApp Pro Web.
+              </p>
+              <div className="divide-y divide-gray-100 dark:divide-[#2a3942]">
+                {[
+                  { keys: 'Ctrl / Cmd + K', desc: 'Open global search across chats, messages & contacts' },
+                  { keys: 'Enter', desc: 'Send message (when Enter-is-Send is enabled)' },
+                  { keys: 'Shift + Enter', desc: 'Insert a new line in the message composer' },
+                  { keys: 'Ctrl / Cmd + V', desc: 'Paste image directly from clipboard into active chat' },
+                  { keys: '@username', desc: 'Mention a group participant while typing' },
+                  { keys: 'Drag & Drop', desc: 'Drop any image, video, or document onto chat to send' },
+                ].map((item) => (
+                  <div key={item.keys} className="flex items-center justify-between py-3 gap-4 text-sm">
+                    <span className="text-[#54656f] dark:text-[#aebac1]">{item.desc}</span>
+                    <kbd className="px-2.5 py-1 rounded-lg bg-gray-100 dark:bg-[#111b21] border border-gray-200 dark:border-[#2a3942] font-mono text-xs shrink-0">
+                      {item.keys}
+                    </kbd>
+                  </div>
+                ))}
               </div>
             </div>
           )}

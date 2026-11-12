@@ -22,6 +22,8 @@ import {
   Eye,
   RotateCcw,
   ChevronDown,
+  CheckSquare,
+  Square,
 } from 'lucide-react';
 import { MessageType } from '@whatsapp-pro/shared-types';
 import { LocalMessage } from '@/stores/chatStore';
@@ -69,6 +71,10 @@ interface MessageBubbleProps {
   onVotePoll?: (msg: LocalMessage, optionId: string) => void;
   onJumpToMessage?: (messageId: string) => void;
   onImagePreview?: (url: string) => void;
+  memberNamesById?: Record<string, string>;
+  selectionMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: (msg: LocalMessage) => void;
 }
 
 function parseJsonSafe<T>(text?: string | null): T | null {
@@ -117,6 +123,10 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   onVotePoll,
   onJumpToMessage,
   onImagePreview,
+  memberNamesById,
+  selectionMode = false,
+  selected = false,
+  onToggleSelect,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [showMoreEmojis, setShowMoreEmojis] = useState(false);
@@ -409,8 +419,28 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   return (
     <div
       id={`msg-${message.id}`}
-      className={`group flex flex-col ${isOwn ? 'items-end' : 'items-start'} px-3 sm:px-6 py-0.5 relative`}
+      onClick={() => {
+        if (selectionMode && onToggleSelect) {
+          onToggleSelect(message);
+        }
+      }}
+      className={`group flex ${isOwn ? 'justify-end' : 'justify-start'} items-center gap-2 px-3 sm:px-6 py-0.5 relative ${
+        selected ? 'bg-[#00A884]/10 rounded-lg' : ''
+      } ${selectionMode ? 'cursor-pointer' : ''}`}
     >
+      {selectionMode && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleSelect?.(message);
+          }}
+          className="text-[#00A884] shrink-0"
+          title={selected ? 'Deselect message' : 'Select message'}
+        >
+          {selected ? <CheckSquare className="w-5 h-5" /> : <Square className="w-5 h-5 text-[#667781]" />}
+        </button>
+      )}
       <div
         className={`relative max-w-[85%] sm:max-w-[68%] rounded-2xl px-3 py-2 shadow-sm ${
           isOwn
@@ -485,10 +515,14 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           <div className="flex flex-wrap gap-1 mt-1.5">
             {Array.from(reactionMap.entries()).map(([emoji, userIds]) => {
               const mine = userIds.includes(currentUserId);
+              const reactorNames = userIds.map((uid) =>
+                uid === currentUserId ? 'You' : memberNamesById?.[uid] || 'Member',
+              );
               return (
                 <button
                   key={emoji}
                   type="button"
+                  title={`${emoji} · ${reactorNames.join(', ')}`}
                   onClick={() => onReact(message, emoji)}
                   className={`px-1.5 py-0.5 rounded-full text-xs flex items-center gap-1 border transition ${
                     mine
@@ -497,6 +531,11 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                   }`}
                 >
                   <span>{emoji}</span>
+                  {reactorNames.length === 1 && (
+                    <span className="text-[10px] max-w-[72px] truncate opacity-80">
+                      {reactorNames[0]}
+                    </span>
+                  )}
                   {userIds.length > 1 && <span className="text-[10px]">{userIds.length}</span>}
                 </button>
               );
@@ -685,6 +724,18 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             >
               <Info className="w-4 h-4" /> Message info
             </button>
+            {onToggleSelect && (
+              <button
+                type="button"
+                onClick={() => {
+                  onToggleSelect(message);
+                  setMenuOpen(false);
+                }}
+                className="w-full px-3.5 py-2 text-left hover:bg-gray-100 dark:hover:bg-[#182229] flex items-center gap-2.5"
+              >
+                <CheckSquare className="w-4 h-4" /> {selected ? 'Deselect' : 'Select'}
+              </button>
+            )}
             <div className="border-t border-gray-100 dark:border-[#2a3942] my-1" />
             <button
               type="button"

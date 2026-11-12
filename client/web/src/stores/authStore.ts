@@ -387,10 +387,15 @@ export const useAuthStore = create<AuthState>()(
         },
 
         fetchDevices: async () => {
-          const res = await api.get('/users/devices');
-          const devices = unwrapData<UserDevice[]>(res.data);
-          set({ devices: Array.isArray(devices) ? devices : [] });
-          return devices;
+          try {
+            const res = await api.get('/users/devices');
+            const devices = unwrapData<UserDevice[]>(res.data);
+            const list = Array.isArray(devices) ? devices : [];
+            set({ devices: list });
+            return list;
+          } catch {
+            return get().devices;
+          }
         },
 
         revokeDevice: async (deviceId) => {

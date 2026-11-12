@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Search,
   MessageSquarePlus,
@@ -21,17 +21,20 @@ import {
   X,
   Star,
   MoreVertical,
+  Trash2,
 } from 'lucide-react';
 import {
   CallType,
   ConversationType,
   FontSize,
+  MessageType,
   User,
 } from '@whatsapp-pro/shared-types';
 import { useAuthStore } from '@/stores/authStore';
 import { ConversationWithMeta, LocalMessage, useChatStore } from '@/stores/chatStore';
 import { useCallStore } from '@/stores/callStore';
 import { useThemeStore, WALLPAPER_PRESETS } from '@/stores/themeStore';
+import { getStoredTokens } from '@/lib/api';
 import { socketManager } from '@/lib/socket';
 import { Avatar } from '@/components/common/Avatar';
 import { MessageBubble } from '@/components/chat/MessageBubble';
@@ -90,8 +93,9 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
 }) => {
   const { conversationId: routeConvId } = useParams<{ conversationId: string }>();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
 
-  const { user } = useAuthStore();
+  const { user, isAuthenticated } = useAuthStore();
   const {
     conversations,
     activeConversationId,
@@ -121,6 +125,7 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
     muteConversation,
     retryMessage,
     votePoll,
+    sendMediaMessage,
   } = useChatStore();
 
   const { initiateCall } = useCallStore();
@@ -143,6 +148,8 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [convMenuId, setConvMenuId] = useState<string | null>(null);
   const [showScrollDown, setShowScrollDown] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [selectedMessageIds, setSelectedMessageIds] = useState<string[]>([]);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const currentUserId = user?.id || '';
@@ -156,10 +163,15 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
 
   // Fast, flicker-free HTTP polling when WebSocket is unavailable (e.g. serverless deployment)
   useEffect(() => {
-    if (socketConnected) return;
+    if (!isAuthenticated || socketConnected) return;
+
+    const canPoll = () =>
+      document.visibilityState === 'visible' &&
+      useAuthStore.getState().isAuthenticated &&
+      Boolean(getStoredTokens().accessToken);
 
     const syncNow = () => {
-      if (document.visibilityState !== 'visible') return;
+      if (!canPoll()) return;
       void fetchConversations({ silent: true });
       if (activeConversationId) {
         void fetchMessages(activeConversationId, false, { silent: true });
@@ -167,12 +179,12 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
     };
 
     const msgInterval = window.setInterval(() => {
-      if (document.visibilityState !== 'visible' || !activeConversationId) return;
+      if (!canPoll() || !activeConversationId) return;
       void fetchMessages(activeConversationId, false, { silent: true });
     }, 2500);
 
     const convInterval = window.setInterval(() => {
-      if (document.visibilityState !== 'visible') return;
+      if (!canPoll()) return;
       void fetchConversations({ silent: true });
     }, 4000);
 
@@ -185,20 +197,21 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
       window.removeEventListener('focus', syncNow);
       document.removeEventListener('visibilitychange', syncNow);
     };
-  }, [socketConnected, activeConversationId, fetchConversations, fetchMessages]);
+  }, [isAuthenticated, socketConnected, activeConversationId, fetchConversations, fetchMessages]);
 
   useEffect(() => {
     setFilterTab(initialFilter);
   }, [initialFilter]);
 
   useEffect(() => {
+    if (!isAuthenticated || !getStoredTokens().accessToken) return;
     void fetchConversations();
     void fetchContacts();
     void fetchBlockedUsers();
     if (showStarredOnly) {
       void fetchStarredMessages();
     }
-  }, [fetchConversations, fetchContacts, fetchBlockedUsers, fetchStarredMessages, showStarredOnly]);
+  }, [isAuthenticated, fetchConversations, fetchContacts, fetchBlockedUsers, fetchStarredMessages, showStarredOnly]);
 
   useEffect(() => {
     if (routeConvId && routeConvId !== activeConversationId) {
@@ -206,10 +219,53 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
     }
   }, [routeConvId, activeConversationId, setActiveConversation]);
 
+  useEffect(() => {
+    if (searchParams.get('search') === '1') {
+      setGlobalSearchOpen(true);
+      setSearchParams((prev) => { prev.delete('search'); return prev; });
+    }
+  }, [searchParams, setSearchParams]);
+
   const activeConversation = useMemo(
     () => conversations.find((c) => c.id === activeConversationId) || null,
     [conversations, activeConversationId],
   );
+
+  useEffect(() => {
+    setSelectedMessageIds([]);
+  }, [activeConversationId]);
+
+  const memberNamesById = useMemo(() => {
+    const map: Record<string, string> = {};
+    (activeConversation?.members || []).forEach((m) => {
+      if (m.userId && m.user) {
+        map[m.userId] = m.user.displayName || m.user.phoneNumber || 'Member';
+      }
+    });
+    return map;
+  }, [activeConversation]);
+
+  const handleToggleSelectMessage = (msg: LocalMessage) => {
+    setSelectedMessageIds((prev) =>
+      prev.includes(msg.id) ? prev.filter((id) => id !== msg.id) : [...prev, msg.id],
+    );
+  };
+
+  const handleBulkStarSelected = async () => {
+    if (!activeConversation) return;
+    const targets = activeMessages.filter((m) => selectedMessageIds.includes(m.id));
+    await Promise.all(targets.map((m) => toggleStar(m.id, m.conversationId, m.isStarred)));
+    setSelectedMessageIds([]);
+    toast.success(`Updated star on ${targets.length} message(s)`);
+  };
+
+  const handleBulkDeleteSelected = async () => {
+    if (!activeConversation) return;
+    const targets = activeMessages.filter((m) => selectedMessageIds.includes(m.id));
+    await Promise.all(targets.map((m) => deleteMessage(m.id, m.conversationId, false)));
+    setSelectedMessageIds([]);
+    toast.success(`Deleted ${targets.length} message(s)`);
+  };
 
   const activeMessages = useMemo(() => {
     if (!activeConversationId) return [];
@@ -725,7 +781,31 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
               const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
               setShowScrollDown(distFromBottom > 240);
             }}
+            onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+            onDragLeave={() => setIsDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setIsDragOver(false);
+              const files = Array.from(e.dataTransfer.files);
+              if (files.length > 0 && activeConversation) {
+                files.forEach((file) => {
+                  const messageType = file.type.startsWith('image/')
+                    ? MessageType.IMAGE
+                    : file.type.startsWith('video/')
+                      ? MessageType.VIDEO
+                      : file.type.startsWith('audio/')
+                        ? MessageType.AUDIO
+                        : MessageType.DOCUMENT;
+                  void sendMediaMessage(activeConversation.id, { file, messageType });
+                });
+              }
+            }}
           >
+            {isDragOver && (
+              <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#00A884]/20 border-2 border-dashed border-[#00A884] rounded-lg pointer-events-none">
+                <p className="text-[#00A884] font-semibold text-lg">Drop files to send</p>
+              </div>
+            )}
             {/* Cursor Pagination Load Older */}
             {hasMoreByConv[activeConversation.id] && (
               <div className="flex justify-center py-2">
@@ -798,6 +878,10 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
                       document.getElementById(`msg-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
                     }}
                     onImagePreview={(url) => setLightboxUrl(url)}
+                    memberNamesById={memberNamesById}
+                    selectionMode={selectedMessageIds.length > 0}
+                    selected={selectedMessageIds.includes(msg.id)}
+                    onToggleSelect={handleToggleSelectMessage}
                   />
                 </React.Fragment>
               );
@@ -807,13 +891,48 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
               <button
                 type="button"
                 onClick={() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })}
-                className="sticky bottom-3 ml-auto mr-4 w-9 h-9 rounded-full bg-white dark:bg-[#202c33] border border-gray-200 dark:border-[#2a3942] shadow-lg flex items-center justify-center text-[#54656f] dark:text-[#aebac1] hover:text-[#00A884] transition z-20"
+                className="absolute bottom-3 right-4 w-9 h-9 rounded-full bg-white dark:bg-[#202c33] border border-gray-200 dark:border-[#2a3942] shadow-lg flex items-center justify-center text-[#54656f] dark:text-[#aebac1] hover:text-[#00A884] transition z-20"
                 title="Scroll to latest messages"
               >
                 <ChevronDown className="w-5 h-5" />
               </button>
             )}
           </div>
+
+          {/* Bulk Selection Toolbar */}
+          {selectedMessageIds.length > 0 && (
+            <div className="px-4 py-2.5 bg-[#f0f2f5] dark:bg-[#202c33] border-t border-gray-200 dark:border-[#2a3942] flex items-center justify-between text-xs">
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setSelectedMessageIds([])}
+                  className="p-1 rounded-full hover:bg-gray-200 dark:hover:bg-[#2a3942]"
+                  title="Cancel selection"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+                <span className="font-semibold text-sm">
+                  {selectedMessageIds.length} selected
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleBulkStarSelected()}
+                  className="px-3 py-1.5 rounded-lg bg-white dark:bg-[#2a3942] hover:bg-gray-100 flex items-center gap-1.5 font-medium"
+                >
+                  <Star className="w-3.5 h-3.5 text-amber-400" /> Star
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleBulkDeleteSelected()}
+                  className="px-3 py-1.5 rounded-lg bg-red-500/10 text-red-500 hover:bg-red-500/20 flex items-center gap-1.5 font-medium"
+                >
+                  <Trash2 className="w-3.5 h-3.5" /> Delete
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Composer */}
           <MessageComposer conversation={activeConversation} currentUserId={currentUserId} />

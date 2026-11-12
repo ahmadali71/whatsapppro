@@ -21,6 +21,7 @@ import { useThemeStore } from '@/stores/themeStore';
 import { API_ORIGIN, extractErrorMessage } from '@/lib/api';
 import { socketManager } from '@/lib/socket';
 import { toast } from '@/stores/toastStore';
+import { compressImageFile } from '@/lib/imageUtils';
 
 const SAMPLE_STICKERS = ['🎉', '🔥', '🚀', '💯', '🤩', '🥳', '❤️‍🔥', '🙌'];
 const SAMPLE_GIFS = [
@@ -605,6 +606,26 @@ export const MessageComposer: React.FC<MessageComposerProps> = ({ conversation, 
             value={text}
             onChange={(e) => handleTextChange(e.target.value)}
             onKeyDown={handleKeyDown}
+            onPaste={async (e) => {
+              const items = Array.from(e.clipboardData.items);
+              const imgItem = items.find((it) => it.type.startsWith('image/'));
+              if (imgItem) {
+                e.preventDefault();
+                const file = imgItem.getAsFile();
+                if (file) {
+                  try {
+                    const compressed = await compressImageFile(file);
+                    await sendMediaMessage(conversation.id, {
+                      file: compressed,
+                      fileName: 'pasted-image.jpg',
+                      messageType: MessageType.IMAGE,
+                    });
+                  } catch {
+                    toast.error('Failed to send pasted image');
+                  }
+                }
+              }
+            }}
             placeholder="Type a message"
             className="flex-1 max-h-32 resize-none px-4 py-2.5 rounded-2xl bg-white dark:bg-[#2a3942] text-sm focus:outline-none placeholder:text-[#667781] dark:placeholder:text-[#8696a0]"
           />

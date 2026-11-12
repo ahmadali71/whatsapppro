@@ -57,6 +57,15 @@ export class UsersService {
     private readonly otpService: OtpService,
   ) {}
 
+  async updatePresence(userId: string, isOnline: boolean) {
+    await this.prisma.userProfile.upsert({
+      where: { userId },
+      create: { userId, isOnline, lastSeen: new Date() },
+      update: { isOnline, lastSeen: new Date() },
+    });
+    return { ok: true };
+  }
+
   async getMe(userId: string) {
     const user = await this.prisma.user.findFirst({
       where: { id: userId, deletedAt: null },

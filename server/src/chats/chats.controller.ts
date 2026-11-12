@@ -135,6 +135,7 @@ export class ChatsController {
     @Req() req: AuthenticatedRequest,
     @Param('id', ParseUUIDPipe) conversationId: string,
     @Query() query: PaginateDto,
+    @Query('q') q?: string,
   ) {
     const userId = this.getUserId(req);
     return this.chatsService.getMessages(
@@ -142,6 +143,7 @@ export class ChatsController {
       userId,
       query.cursor,
       query.limit,
+      q,
     );
   }
 
@@ -167,6 +169,18 @@ export class ChatsController {
   ) {
     const userId = this.getUserId(req);
     return this.chatsService.markAsRead(userId, conversationId, messageId);
+  }
+
+  @Post('chats/:id/typing')
+  @ApiOperation({ summary: 'Send typing indicator event (serverless REST fallback)' })
+  @ApiParam({ name: 'id', format: 'uuid' })
+  async sendTyping(
+    @Req() req: AuthenticatedRequest,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body('isTyping') isTyping: boolean,
+  ) {
+    const userId = this.getUserId(req);
+    return this.chatsService.sendTypingEvent(userId, conversationId, isTyping);
   }
 
   // Static route MUST precede parameterized :id routes
