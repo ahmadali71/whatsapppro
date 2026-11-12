@@ -51,6 +51,7 @@ const MESSAGE_INCLUDE = {
 @Injectable()
 export class ChatsService {
   private readonly logger = new Logger(ChatsService.name);
+  private readonly lastPresenceHeartbeat = new Map<string, number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -70,113 +71,152 @@ export class ChatsService {
   ) {
     const take = Math.min(limit, 100);
 
-    const archivedRecords = await this.prisma.archivedChat.findMany({
-      where: { userId },
-      select: { conversationId: true },
-    });
-    const archivedIds = new Set(archivedRecords.map((a) => a.conversationId));
-
-    const where: Prisma.ConversationMemberWhereInput = {
-      userId,
-      isActive: true,
-      leftAt: null,
-      ...(archived === true
-        ? { conversationId: { in: Array.from(archivedIds) } }
-        : archived === false
-          ? { conversationId: { notIn: Array.from(archivedIds) } }
-          : {}),
-      ...(search
-        ? {
-            conversation: {
-              OR: [
-                {
-                  group: {
-                    name: { contains: search, mode: 'insensitive' },
+    const buildMemberQuery = (archivedIds: Set<string>) => {
+      const where: Prisma.ConversationMemberWhereInput = {
+        userId,
+        isActive: true,
+        leftAt: null,
+        ...(archived === true
+          ? { conversationId: { in: Array.from(archivedIds) } }
+          : archived === false
+            ? { conversationId: { notIn: Array.from(archivedIds) } }
+            : {}),
+        ...(search
+          ? {
+              conversation: {
+                OR: [
+                  {
+                    group: {
+                      name: { contains: search, mode: 'insensitive' },
+                    },
                   },
-                },
-                {
-                  members: {
-                    some: {
-                      userId: { not: userId },
-                      user: {
-                        OR: [
-                          { displayName: { contains: search, mode: 'insensitive' } },
-                          { username: { contains: search, mode: 'insensitive' } },
-                          { phoneNumber: { contains: search } },
-                        ],
+                  {
+                    members: {
+                      some: {
+                        userId: { not: userId },
+                        user: {
+                          OR: [
+                            { displayName: { contains: search, mode: 'insensitive' } },
+                            { username: { contains: search, mode: 'insensitive' } },
+                            { phoneNumber: { contains: search } },
+                          ],
+                        },
+                      },
+                    },
+                  },
+                ],
+              },
+            }
+          : {}),
+      };
+
+      return this.prisma.conversationMember.findMany({
+        where,
+        take: take + 1,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        orderBy: [{ conversation: { updatedAt: 'desc' } }, { id: 'desc' }],
+        include: {
+          conversation: {
+            include: {
+              members: {
+                where: { isActive: true },
+                include: {
+                  user: {
+                    select: {
+                      id: true,
+                      displayName: true,
+                      username: true,
+                      phoneNumber: true,
+                      avatarUrl: true,
+                      about: true,
+                      profile: {
+                        select: { isOnline: true, lastSeen: true },
                       },
                     },
                   },
                 },
-              ],
-            },
-          }
-        : {}),
-    };
-
-    const memberships = await this.prisma.conversationMember.findMany({
-      where,
-      take: take + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      orderBy: [{ conversation: { updatedAt: 'desc' } }, { id: 'desc' }],
-      include: {
-        conversation: {
-          include: {
-            members: {
-              where: { isActive: true },
-              include: {
-                user: {
-                  select: {
-                    id: true,
-                    displayName: true,
-                    username: true,
-                    phoneNumber: true,
-                    avatarUrl: true,
-                    about: true,
-                    profile: {
-                      select: { isOnline: true, lastSeen: true },
-                    },
-                  },
-                },
               },
-            },
-            group: true,
-            messages: {
-              orderBy: { createdAt: 'desc' },
-              take: 1,
-              include: MESSAGE_INCLUDE,
+              group: true,
+              messages: {
+                orderBy: { createdAt: 'desc' },
+                take: 1,
+                include: MESSAGE_INCLUDE,
+              },
             },
           },
         },
-      },
-    });
+      });
+    };
+
+    let archivedRecords: Array<{ conversationId: string }>;
+    let memberships: Awaited<ReturnType<typeof buildMemberQuery>>;
+
+    if (archived === undefined) {
+      [archivedRecords, memberships] = await Promise.all([
+        this.prisma.archivedChat.findMany({
+          where: { userId },
+          select: { conversationId: true },
+        }),
+        buildMemberQuery(new Set()),
+      ]);
+    } else {
+      archivedRecords = await this.prisma.archivedChat.findMany({
+        where: { userId },
+        select: { conversationId: true },
+      });
+      memberships = await buildMemberQuery(new Set(archivedRecords.map((a) => a.conversationId)));
+    }
+
+    const archivedIds = new Set(archivedRecords.map((a) => a.conversationId));
 
     const hasNextPage = memberships.length > take;
     const items = hasNextPage ? memberships.slice(0, take) : memberships;
     const nextCursor = hasNextPage ? items[items.length - 1].id : undefined;
 
-    // Best-effort presence heartbeat and delivery confirmation for serverless HTTP polling
-    const convIds = items.map((m) => m.conversationId);
-    const now = new Date();
-    try {
-      await Promise.all([
-        this.prisma.userProfile.updateMany({
-          where: { userId },
-          data: { isOnline: true, lastSeen: now },
-        }),
-        convIds.length > 0
-          ? this.prisma.message.updateMany({
-              where: {
-                conversationId: { in: convIds },
-                senderId: { not: userId },
-                deliveredAt: null,
-              },
-              data: { deliveredAt: now },
-            })
-          : Promise.resolve(),
-      ]);
-    } catch {
-      // Non-fatal in serverless or test mocks
+    // Best-effort throttled presence heartbeat (at most once per 30s) & targeted delivery confirmation
+    const nowMs = Date.now();
+    const now = new Date(nowMs);
+    const lastHeartbeat = this.lastPresenceHeartbeat.get(userId) ?? 0;
+    const shouldUpdatePresence = nowMs - lastHeartbeat > 30_000;
+    const deliveryCandidateConvIds = items
+      .filter((m) => {
+        const lastMsg = m.conversation.messages[0];
+        return (
+          m.unreadCount > 0 ||
+          Boolean(lastMsg && lastMsg.senderId !== userId && !lastMsg.deliveredAt)
+        );
+      })
+      .map((m) => m.conversationId);
+
+    if (shouldUpdatePresence || deliveryCandidateConvIds.length > 0) {
+      if (shouldUpdatePresence) {
+        if (this.lastPresenceHeartbeat.size > 1000) {
+          this.lastPresenceHeartbeat.clear();
+        }
+        this.lastPresenceHeartbeat.set(userId, nowMs);
+      }
+      try {
+        await Promise.all([
+          shouldUpdatePresence
+            ? this.prisma.userProfile.updateMany({
+                where: { userId },
+                data: { isOnline: true, lastSeen: now },
+              })
+            : Promise.resolve(),
+          deliveryCandidateConvIds.length > 0
+            ? this.prisma.message.updateMany({
+                where: {
+                  conversationId: { in: deliveryCandidateConvIds },
+                  senderId: { not: userId },
+                  deliveredAt: null,
+                },
+                data: { deliveredAt: now },
+              })
+            : Promise.resolve(),
+        ]);
+      } catch {
+        // Non-fatal in serverless or test mocks
+      }
     }
 
     return {
@@ -382,21 +422,26 @@ export class ChatsService {
     limit = 20,
     q?: string,
   ) {
-    await this.assertMember(conversationId, userId);
     const take = Math.min(limit, 100);
 
-    let deletedForMeIds: string[] = [];
-    let pinnedIds: string[] = [];
-    try {
-      [deletedForMeIds, pinnedIds] = await Promise.all([
-        this.redis.smembers(`deleted_for_me:${userId}`),
-        this.redis.smembers(`pinned:${conversationId}`),
-      ]);
-    } catch (error) {
-      this.logger.warn(
-        `Non-fatal Redis read failure in getMessages(${conversationId}): ${(error as Error).message}`,
-      );
-    }
+    const readRedisLists = async () => {
+      try {
+        return await Promise.all([
+          this.redis.smembers(`deleted_for_me:${userId}`),
+          this.redis.smembers(`pinned:${conversationId}`),
+        ]);
+      } catch (error) {
+        this.logger.warn(
+          `Non-fatal Redis read failure in getMessages(${conversationId}): ${(error as Error).message}`,
+        );
+        return [[], []] as [string[], string[]];
+      }
+    };
+
+    const [, [deletedForMeIds, pinnedIds]] = await Promise.all([
+      this.assertMember(conversationId, userId),
+      readRedisLists(),
+    ]);
     const pinnedSet = new Set(pinnedIds);
 
     const messages = await this.prisma.message.findMany({

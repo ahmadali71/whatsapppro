@@ -181,12 +181,12 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
     const msgInterval = window.setInterval(() => {
       if (!canPoll() || !activeConversationId) return;
       void fetchMessages(activeConversationId, false, { silent: true });
-    }, 2500);
+    }, 3000);
 
     const convInterval = window.setInterval(() => {
       if (!canPoll()) return;
       void fetchConversations({ silent: true });
-    }, 4000);
+    }, 6000);
 
     window.addEventListener('focus', syncNow);
     document.addEventListener('visibilitychange', syncNow);

@@ -730,6 +730,7 @@ export const useCallStore = create<CallState>((set, get) => ({
 
     const pollIncoming = async () => {
       if (cancelled || incomingBusy || socketManager.isConnected || get().activeCall) return;
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
       const auth = useAuthStore.getState();
       const currentUserId = auth.user?.id;
       if (!auth.isAuthenticated || !currentUserId || !getStoredTokens().accessToken) return;
@@ -876,7 +877,7 @@ export const useCallStore = create<CallState>((set, get) => ({
     void pollIncoming();
     const incomingTimer = window.setInterval(() => {
       void pollIncoming();
-    }, 2500);
+    }, 3500);
     const activeTimer = window.setInterval(() => {
       void pollActiveCall();
     }, 800);

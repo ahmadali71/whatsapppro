@@ -152,9 +152,17 @@ function loadPinnedMsgs(): Record<string, string[]> {
   }
 }
 
+const e2eePlainCache = new Map<string, string>();
+
 async function maybeDecryptMessage(msg: Message): Promise<LocalMessage> {
   const currentUserId = useAuthStore.getState().user?.id;
   if (msg.isEncrypted && msg.content) {
+    const memKey = `${msg.id}:${msg.content}`;
+    const memCached = e2eePlainCache.get(memKey);
+    if (memCached !== undefined) {
+      return { ...msg, decryptedContent: memCached };
+    }
+
     let cachedPlain: string | null = null;
     try {
       cachedPlain =
@@ -164,6 +172,7 @@ async function maybeDecryptMessage(msg: Message): Promise<LocalMessage> {
       // Ignore storage errors
     }
     if (cachedPlain) {
+      e2eePlainCache.set(memKey, cachedPlain);
       return { ...msg, decryptedContent: cachedPlain };
     }
   }
@@ -174,6 +183,7 @@ async function maybeDecryptMessage(msg: Message): Promise<LocalMessage> {
       decryptedContent &&
       !decryptedContent.startsWith('🔒 Encrypted message (unable to decrypt')
     ) {
+      e2eePlainCache.set(`${msg.id}:${msg.content}`, decryptedContent);
       try {
         localStorage.setItem(`e2ee_plain_${msg.id}`, decryptedContent);
       } catch {
@@ -255,6 +265,17 @@ function upsertMessage(
 }
 
 const lastMarkedReadByConv = new Map<string, string>();
+let conversationsInFlight: Promise<void> | null = null;
+const messagesInFlight = new Map<string, Promise<void>>();
+
+function computeMessagesSignature(list: LocalMessage[]): string {
+  return list
+    .map(
+      (m) =>
+        `${m.id}|${m.updatedAt || ''}|${m.deliveredAt || ''}|${m.readAt || ''}|${m.isEdited ? 1 : 0}|${m.isDeletedForEveryone ? 1 : 0}|${m.isStarred ? 1 : 0}|${m.reactions?.length || 0}`,
+    )
+    .join(';');
+}
 
 export const useChatStore = create<ChatState>((set, get) => ({
   conversations: [],
@@ -319,66 +340,80 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   fetchConversations: async (options) => {
+    if (conversationsInFlight) {
+      return conversationsInFlight;
+    }
     const silent = Boolean(options?.silent);
     if (!silent) {
       set({ isLoadingConversations: true });
     }
-    try {
-      const res = await api.get('/chats');
-      const raw = unwrapData<ConversationWithMeta[] | { items?: ConversationWithMeta[]; conversations?: ConversationWithMeta[] }>(
-        res.data,
-      );
-      const list = Array.isArray(raw) ? raw : raw?.items || raw?.conversations || [];
+    conversationsInFlight = (async () => {
+      try {
+        const res = await api.get('/chats');
+        const raw = unwrapData<ConversationWithMeta[] | { items?: ConversationWithMeta[]; conversations?: ConversationWithMeta[] }>(
+          res.data,
+        );
+        const list = Array.isArray(raw) ? raw : raw?.items || raw?.conversations || [];
 
-      const onlineMap = { ...get().onlineUsers };
-      const nowMs = Date.now();
-      const decryptedList = await Promise.all(
-        list.map(async (conv) => {
-          socketManager.joinConversation(conv.id);
-          conv.members?.forEach((m) => {
-            socketManager.emit(SocketEvents.PRESENCE_SUBSCRIBE, { userId: m.userId }, false);
-            if (m.user) {
-              const profile = (
-                m.user as User & { profile?: { isOnline?: boolean; lastSeen?: string | null } }
-              ).profile;
-              if (profile) {
-                const lastSeenMs = profile.lastSeen ? new Date(profile.lastSeen).getTime() : 0;
-                const recentlyActive = lastSeenMs > 0 && nowMs - lastSeenMs < 60_000;
-                onlineMap[m.userId] = {
-                  isOnline: Boolean(profile.isOnline && (recentlyActive || socketManager.isConnected)),
-                  lastSeen: profile.lastSeen || undefined,
-                };
-              } else if (!(m.userId in onlineMap)) {
-                onlineMap[m.userId] = { isOnline: false };
+        const onlineMap = { ...get().onlineUsers };
+        const nowMs = Date.now();
+        const decryptedList = await Promise.all(
+          list.map(async (conv) => {
+            socketManager.joinConversation(conv.id);
+            conv.members?.forEach((m) => {
+              socketManager.emit(SocketEvents.PRESENCE_SUBSCRIBE, { userId: m.userId }, false);
+              if (m.user) {
+                const profile = (
+                  m.user as User & { profile?: { isOnline?: boolean; lastSeen?: string | null } }
+                ).profile;
+                if (profile) {
+                  const lastSeenMs = profile.lastSeen ? new Date(profile.lastSeen).getTime() : 0;
+                  const recentlyActive = lastSeenMs > 0 && nowMs - lastSeenMs < 60_000;
+                  onlineMap[m.userId] = {
+                    isOnline: Boolean(profile.isOnline && (recentlyActive || socketManager.isConnected)),
+                    lastSeen: profile.lastSeen || undefined,
+                  };
+                } else if (!(m.userId in onlineMap)) {
+                  onlineMap[m.userId] = { isOnline: false };
+                }
               }
+            });
+            const membershipUnread = (
+              conv as ConversationWithMeta & { membership?: { unreadCount?: number } }
+            ).membership?.unreadCount;
+            const unreadCount =
+              typeof membershipUnread === 'number' ? membershipUnread : conv.unreadCount ?? 0;
+            if (conv.lastMessage) {
+              const dec = await maybeDecryptMessage(conv.lastMessage);
+              return { ...conv, unreadCount, lastMessage: dec };
             }
-          });
-          const membershipUnread = (
-            conv as ConversationWithMeta & { membership?: { unreadCount?: number } }
-          ).membership?.unreadCount;
-          const unreadCount =
-            typeof membershipUnread === 'number' ? membershipUnread : conv.unreadCount ?? 0;
-          if (conv.lastMessage) {
-            const dec = await maybeDecryptMessage(conv.lastMessage);
-            return { ...conv, unreadCount, lastMessage: dec };
-          }
-          return { ...conv, unreadCount };
-        }),
-      );
+            return { ...conv, unreadCount };
+          }),
+        );
 
-      set({
-        conversations: decryptedList,
-        onlineUsers: onlineMap,
-        ...(silent ? {} : { isLoadingConversations: false }),
-      });
-    } catch {
-      if (!silent) {
-        set({ isLoadingConversations: false });
+        set({
+          conversations: decryptedList,
+          onlineUsers: onlineMap,
+          ...(silent ? {} : { isLoadingConversations: false }),
+        });
+      } catch {
+        if (!silent) {
+          set({ isLoadingConversations: false });
+        }
+      } finally {
+        conversationsInFlight = null;
       }
-    }
+    })();
+    return conversationsInFlight;
   },
 
   fetchMessages: async (conversationId, loadMore = false, options) => {
+    const flightKey = `${conversationId}:${loadMore ? 'more' : 'head'}`;
+    const existingFlight = messagesInFlight.get(flightKey);
+    if (existingFlight) {
+      return existingFlight;
+    }
+
     const silent = Boolean(options?.silent);
     const cursor = loadMore ? get().nextCursorByConv[conversationId] : undefined;
     if (loadMore && !cursor) return;
@@ -386,54 +421,69 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!silent) {
       set({ isLoadingMessages: true });
     }
-    try {
-      const res = await api.get(`/chats/${conversationId}/messages`, {
-        params: { cursor: cursor || undefined, limit: 40 },
-      });
-      const raw = unwrapData<
-        Message[] | { items?: Message[]; messages?: Message[]; nextCursor?: string | null; hasMore?: boolean }
-      >(res.data);
+    const job = (async () => {
+      try {
+        const res = await api.get(`/chats/${conversationId}/messages`, {
+          params: { cursor: cursor || undefined, limit: 40 },
+        });
+        const raw = unwrapData<
+          Message[] | { items?: Message[]; messages?: Message[]; nextCursor?: string | null; hasMore?: boolean }
+        >(res.data);
 
-      const items = Array.isArray(raw) ? raw : raw?.items || raw?.messages || [];
-      const nextCursor = Array.isArray(raw) ? null : raw?.nextCursor ?? null;
-      const hasMore = Array.isArray(raw) ? items.length >= 40 : Boolean(raw?.hasMore ?? nextCursor);
+        const items = Array.isArray(raw) ? raw : raw?.items || raw?.messages || [];
+        const nextCursor = Array.isArray(raw) ? null : raw?.nextCursor ?? null;
+        const hasMore = Array.isArray(raw) ? items.length >= 40 : Boolean(raw?.hasMore ?? nextCursor);
 
-      const decrypted = await Promise.all(items.map(maybeDecryptMessage));
-      const currentList = get().messagesByConv[conversationId] || [];
-      const existing = loadMore
-        ? currentList
-        : currentList.filter((m) => m.id.startsWith('temp-') && m.clientStatus === 'sending');
+        const decrypted = await Promise.all(items.map(maybeDecryptMessage));
+        const currentList = get().messagesByConv[conversationId] || [];
+        const existing = loadMore
+          ? currentList
+          : currentList.filter((m) => m.id.startsWith('temp-') && m.clientStatus === 'sending');
 
-      // Merge & sort chronologically
-      const mergedMap = new Map<string, LocalMessage>();
-      [...decrypted, ...existing].forEach((m) => mergedMap.set(m.id, m));
-      const sorted = Array.from(mergedMap.values()).sort(
-        (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
-      );
+        // Merge & sort chronologically
+        const mergedMap = new Map<string, LocalMessage>();
+        [...decrypted, ...existing].forEach((m) => mergedMap.set(m.id, m));
+        const sorted = Array.from(mergedMap.values()).sort(
+          (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+        );
 
-      set((state) => ({
-        messagesByConv: { ...state.messagesByConv, [conversationId]: sorted },
-        ...(silent
-          ? {}
-          : {
-              nextCursorByConv: { ...state.nextCursorByConv, [conversationId]: nextCursor },
-              hasMoreByConv: { ...state.hasMoreByConv, [conversationId]: hasMore },
-              isLoadingMessages: false,
-            }),
-      }));
+        const unchanged =
+          silent &&
+          currentList.length === sorted.length &&
+          computeMessagesSignature(currentList) === computeMessagesSignature(sorted);
 
-      if (
-        !loadMore &&
-        get().activeConversationId === conversationId &&
-        (typeof document === 'undefined' || document.visibilityState === 'visible')
-      ) {
-        get().markConversationRead(conversationId);
+        if (!unchanged) {
+          set((state) => ({
+            messagesByConv: { ...state.messagesByConv, [conversationId]: sorted },
+            ...(silent
+              ? {}
+              : {
+                  nextCursorByConv: { ...state.nextCursorByConv, [conversationId]: nextCursor },
+                  hasMoreByConv: { ...state.hasMoreByConv, [conversationId]: hasMore },
+                  isLoadingMessages: false,
+                }),
+          }));
+        } else if (!silent) {
+          set({ isLoadingMessages: false });
+        }
+
+        if (
+          !loadMore &&
+          get().activeConversationId === conversationId &&
+          (typeof document === 'undefined' || document.visibilityState === 'visible')
+        ) {
+          get().markConversationRead(conversationId);
+        }
+      } catch {
+        if (!silent) {
+          set({ isLoadingMessages: false });
+        }
+      } finally {
+        messagesInFlight.delete(flightKey);
       }
-    } catch {
-      if (!silent) {
-        set({ isLoadingMessages: false });
-      }
-    }
+    })();
+    messagesInFlight.set(flightKey, job);
+    return job;
   },
 
   createDirectChat: async (otherUserId) => {

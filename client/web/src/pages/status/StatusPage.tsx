@@ -56,6 +56,7 @@ export const StatusPage: React.FC = () => {
   const [drawColor, setDrawColor] = useState('#25D366');
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const isDrawingRef = useRef(false);
+  const viewedStatusIdsRef = useRef<Set<string>>(new Set());
   const [submitting, setSubmitting] = useState(false);
 
   // Story Viewer
@@ -105,17 +106,29 @@ export const StatusPage: React.FC = () => {
     return Array.from(map.values());
   }, [contactStatuses]);
 
+  // Record view / load own viewers once per viewed status (independent of pause/resume clicks)
+  useEffect(() => {
+    if (!viewerGroup) return;
+    const currentStatus = viewerGroup.items[viewerIndex];
+    if (!currentStatus) return;
+
+    if (!viewerGroup.isMine) {
+      if (!viewedStatusIdsRef.current.has(currentStatus.id)) {
+        viewedStatusIdsRef.current.add(currentStatus.id);
+        void statusesApi.markViewed(currentStatus.id).catch(() => {
+          viewedStatusIdsRef.current.delete(currentStatus.id);
+        });
+      }
+    } else {
+      void statusesApi.getViewers(currentStatus.id).then(setViewersList).catch(() => {});
+    }
+  }, [viewerGroup, viewerIndex]);
+
   // Story Viewer auto-advance timer
   useEffect(() => {
     if (!viewerGroup || paused) return;
     const currentStatus = viewerGroup.items[viewerIndex];
     if (!currentStatus) return;
-
-    if (!viewerGroup.isMine) {
-      void statusesApi.markViewed(currentStatus.id).catch(() => {});
-    } else {
-      void statusesApi.getViewers(currentStatus.id).then(setViewersList).catch(() => {});
-    }
 
     setProgressPct(0);
     const interval = window.setInterval(() => {
@@ -266,8 +279,8 @@ export const StatusPage: React.FC = () => {
     try {
       await statusesApi.reactToStatus(current.id, emoji);
       toast.success(`Reacted ${emoji}`);
-    } catch {
-      toast.error('Failed to react');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to react'));
     }
   };
 

@@ -103,36 +103,124 @@ export const api = axios.create({
   },
 });
 
-let isRefreshing = false;
-let failedQueue: Array<{
-  resolve: (token: string) => void;
-  reject: (err: unknown) => void;
-}> = [];
-
+let refreshPromise: Promise<string> | null = null;
 let onUnauthorizedCallback: (() => void) | null = null;
 
 export function registerUnauthorizedHandler(cb: () => void) {
   onUnauthorizedCallback = cb;
 }
 
-function processQueue(error: unknown, token: string | null = null) {
-  failedQueue.forEach((prom) => {
-    if (error) {
-      prom.reject(error);
-    } else if (token) {
-      prom.resolve(token);
-    }
-  });
-  failedQueue = [];
+function getTokenExpMs(token: string): number | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+    const payload = JSON.parse(atob(padded)) as { exp?: number };
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
 }
 
-api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
-  const { accessToken } = getStoredTokens();
-  if (accessToken && config.headers) {
-    config.headers.Authorization = `Bearer ${accessToken}`;
+function setAuthorizationHeader(
+  headers: InternalAxiosRequestConfig['headers'] | undefined,
+  token: string,
+) {
+  if (!headers) return;
+  const hdrs = headers as unknown as {
+    set?: (name: string, value: string) => void;
+    Authorization?: string;
+  };
+  if (typeof hdrs.set === 'function') {
+    hdrs.set('Authorization', `Bearer ${token}`);
+  } else {
+    hdrs.Authorization = `Bearer ${token}`;
+  }
+}
+
+async function refreshAccessToken(): Promise<string> {
+  if (refreshPromise) {
+    return refreshPromise;
+  }
+
+  const { refreshToken } = getStoredTokens();
+  if (!refreshToken) {
+    clearStoredTokens();
+    onUnauthorizedCallback?.();
+    throw new Error('Session expired');
+  }
+
+  refreshPromise = (async () => {
+    try {
+      const res = await axios.post(
+        `${API_BASE_URL}/auth/refresh`,
+        { refresh_token: refreshToken },
+        { timeout: 15000 },
+      );
+      const payload = unwrapData<{
+        accessToken?: string;
+        refreshToken?: string;
+        access_token?: string;
+        refresh_token?: string;
+      }>(res.data);
+
+      const newAccess = payload.accessToken || payload.access_token;
+      const newRefresh = payload.refreshToken || payload.refresh_token || refreshToken;
+
+      if (!newAccess) {
+        throw new Error('Refresh response missing access token');
+      }
+
+      setStoredTokens(newAccess, newRefresh);
+      return newAccess;
+    } catch (err) {
+      clearStoredTokens();
+      onUnauthorizedCallback?.();
+      throw err;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+}
+
+api.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
+  const url = config.url || '';
+  const isAuthEndpoint =
+    url.includes('/auth/refresh') ||
+    url.includes('/auth/login') ||
+    url.includes('/auth/verify-otp') ||
+    url.includes('/auth/send-otp') ||
+    url.includes('/auth/register');
+
+  if (!isAuthEndpoint) {
+    const { accessToken, refreshToken } = getStoredTokens();
+    const expMs = accessToken ? getTokenExpMs(accessToken) : null;
+    const isExpiringSoon =
+      !accessToken || (expMs !== null && expMs - Date.now() < 60_000);
+
+    if (refreshPromise) {
+      await refreshPromise;
+    } else if (isExpiringSoon && refreshToken) {
+      await refreshAccessToken();
+    }
+  }
+
+  const { accessToken: latestToken } = getStoredTokens();
+  if (latestToken && config.headers) {
+    setAuthorizationHeader(config.headers, latestToken);
   }
   if (config.headers) {
-    config.headers['X-Device-Id'] = getOrCreateDeviceId();
+    const hdrs = config.headers as unknown as {
+      set?: (name: string, value: string) => void;
+    } & Record<string, unknown>;
+    if (typeof hdrs.set === 'function') {
+      hdrs.set('X-Device-Id', getOrCreateDeviceId());
+    } else {
+      hdrs['X-Device-Id'] = getOrCreateDeviceId();
+    }
   }
   if (config.data instanceof FormData && config.headers) {
     const hdrs = config.headers as unknown as { delete?: (name: string) => void } & Record<
@@ -167,61 +255,13 @@ api.interceptors.response.use(
       originalRequest.url?.includes('/auth/register');
 
     if (status === 401 && !originalRequest._retry && !isAuthRefresh && !isAuthLogin) {
-      const { refreshToken } = getStoredTokens();
-      if (!refreshToken) {
-        clearStoredTokens();
-        onUnauthorizedCallback?.();
-        return Promise.reject(error);
-      }
-
-      if (isRefreshing) {
-        return new Promise<string>((resolve, reject) => {
-          failedQueue.push({ resolve, reject });
-        }).then((newToken) => {
-          if (originalRequest.headers) {
-            originalRequest.headers.Authorization = `Bearer ${newToken}`;
-          }
-          return api(originalRequest);
-        });
-      }
-
       originalRequest._retry = true;
-      isRefreshing = true;
-
       try {
-        const res = await axios.post(
-          `${API_BASE_URL}/auth/refresh`,
-          { refresh_token: refreshToken },
-          { timeout: 15000 },
-        );
-        const payload = unwrapData<{
-          accessToken?: string;
-          refreshToken?: string;
-          access_token?: string;
-          refresh_token?: string;
-        }>(res.data);
-
-        const newAccess = payload.accessToken || payload.access_token;
-        const newRefresh = payload.refreshToken || payload.refresh_token || refreshToken;
-
-        if (!newAccess) {
-          throw new Error('Refresh response missing access token');
-        }
-
-        setStoredTokens(newAccess, newRefresh);
-        processQueue(null, newAccess);
-
-        if (originalRequest.headers) {
-          originalRequest.headers.Authorization = `Bearer ${newAccess}`;
-        }
+        const newAccess = await refreshAccessToken();
+        setAuthorizationHeader(originalRequest.headers, newAccess);
         return api(originalRequest);
       } catch (refreshError) {
-        processQueue(refreshError, null);
-        clearStoredTokens();
-        onUnauthorizedCallback?.();
         return Promise.reject(refreshError);
-      } finally {
-        isRefreshing = false;
       }
     }
 

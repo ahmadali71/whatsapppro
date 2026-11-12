@@ -20,13 +20,19 @@ import { SendOtpDto } from './dto/send-otp.dto';
 import { LoginDto, VerifyOtpDto } from './dto/verify-otp.dto';
 import { EnableTwoFactorDto, VerifyTwoFactorDto } from './dto/two-factor.dto';
 
-const BCRYPT_ROUNDS = 12;
+const BCRYPT_ROUNDS = 10;
 const ACCESS_TOKEN_EXPIRY = '15m';
 const REFRESH_TOKEN_EXPIRY = '30d';
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const VALIDATE_USER_CACHE_TTL_MS = 15_000;
 
 @Injectable()
 export class AuthService {
+  private readonly validatedUserCache = new Map<
+    string,
+    { user: ReturnType<AuthService['sanitizeUser']>; expiresAt: number }
+  >();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
@@ -104,7 +110,16 @@ export class AuthService {
     };
   }
 
+  invalidateUserCache(userId: string) {
+    this.validatedUserCache.delete(userId);
+  }
+
   async validateUser(userId: string) {
+    const cached = this.validatedUserCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.user;
+    }
+
     const user = await this.prisma.user.findFirst({
       where: {
         id: userId,
@@ -116,10 +131,19 @@ export class AuthService {
     });
 
     if (!user || !user.isActive || user.isBanned) {
+      this.validatedUserCache.delete(userId);
       return null;
     }
 
-    return this.sanitizeUser(user);
+    const sanitized = this.sanitizeUser(user);
+    if (this.validatedUserCache.size > 500) {
+      this.validatedUserCache.clear();
+    }
+    this.validatedUserCache.set(userId, {
+      user: sanitized,
+      expiresAt: Date.now() + VALIDATE_USER_CACHE_TTL_MS,
+    });
+    return sanitized;
   }
 
   private ensureDatabaseConnected(): void {
@@ -330,6 +354,18 @@ export class AuthService {
     const tokens = await this.generateJwtTokens(updatedUser);
     const refreshTokenHash = await this.hashPassword(tokens.refreshToken);
 
+    // Revoke previous active sessions for the same device so refresh lookup stays small & fast
+    if (deviceId && this.prisma.authenticationSession.updateMany) {
+      await this.prisma.authenticationSession.updateMany({
+        where: {
+          userId: updatedUser.id,
+          deviceId,
+          isRevoked: false,
+        },
+        data: { isRevoked: true },
+      });
+    }
+
     await this.prisma.authenticationSession.create({
       data: {
         userId: updatedUser.id,
@@ -340,6 +376,8 @@ export class AuthService {
         expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
       },
     });
+
+    this.invalidateUserCache(updatedUser.id);
 
     return {
       user: this.sanitizeUser(updatedUser),
@@ -396,6 +434,7 @@ export class AuthService {
       },
     });
 
+    this.invalidateUserCache(userId);
     return { logged_out: true };
   }
 
@@ -432,6 +471,8 @@ export class AuthService {
         isRevoked: false,
         expiresAt: { gt: new Date() },
       },
+      orderBy: { createdAt: 'desc' },
+      take: 15,
     });
 
     let matchedSessionId: string | null = null;
