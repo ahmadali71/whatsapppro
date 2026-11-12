@@ -15,6 +15,9 @@ import {
   Lock,
   Clock,
   ChevronUp,
+  ChevronDown,
+  Check,
+  CheckCheck,
   X,
   Star,
   MoreVertical,
@@ -139,6 +142,7 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
   const [infoMsg, setInfoMsg] = useState<LocalMessage | null>(null);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [convMenuId, setConvMenuId] = useState<string | null>(null);
+  const [showScrollDown, setShowScrollDown] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const currentUserId = user?.id || '';
@@ -488,6 +492,15 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
                           <span className="text-[#25D366] font-medium">typing...</span>
                         ) : conv.lastMessage ? (
                           <>
+                            {conv.lastMessage.senderId === currentUserId &&
+                              !conv.lastMessage.isDeletedForEveryone &&
+                              (conv.lastMessage.readAt ? (
+                                <CheckCheck className="w-3.5 h-3.5 text-[#53bdeb] shrink-0" />
+                              ) : conv.lastMessage.deliveredAt ? (
+                                <CheckCheck className="w-3.5 h-3.5 text-[#667781] dark:text-[#8696a0] shrink-0" />
+                              ) : (
+                                <Check className="w-3.5 h-3.5 text-[#667781] dark:text-[#8696a0] shrink-0" />
+                              ))}
                             {conv.lastMessage.isEncrypted && <Lock className="w-3 h-3 shrink-0" />}
                             <span className="truncate">
                               {conv.lastMessage.isDeletedForEveryone
@@ -704,7 +717,15 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
           )}
 
           {/* Messages Viewport */}
-          <div className="flex-1 overflow-y-auto py-3 space-y-1" style={wallpaperStyle}>
+          <div
+            className="flex-1 overflow-y-auto py-3 space-y-1 relative"
+            style={wallpaperStyle}
+            onScroll={(e) => {
+              const el = e.currentTarget;
+              const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+              setShowScrollDown(distFromBottom > 240);
+            }}
+          >
             {/* Cursor Pagination Load Older */}
             {hasMoreByConv[activeConversation.id] && (
               <div className="flex justify-center py-2">
@@ -782,6 +803,16 @@ export const ChatsPage: React.FC<{ initialFilter?: ChatFilterTab; showStarredOnl
               );
             })}
             <div ref={messagesEndRef} />
+            {showScrollDown && (
+              <button
+                type="button"
+                onClick={() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })}
+                className="sticky bottom-3 ml-auto mr-4 w-9 h-9 rounded-full bg-white dark:bg-[#202c33] border border-gray-200 dark:border-[#2a3942] shadow-lg flex items-center justify-center text-[#54656f] dark:text-[#aebac1] hover:text-[#00A884] transition z-20"
+                title="Scroll to latest messages"
+              >
+                <ChevronDown className="w-5 h-5" />
+              </button>
+            )}
           </div>
 
           {/* Composer */}

@@ -21,6 +21,7 @@ import {
   ExternalLink,
   Eye,
   RotateCcw,
+  ChevronDown,
 } from 'lucide-react';
 import { MessageType } from '@whatsapp-pro/shared-types';
 import { LocalMessage } from '@/stores/chatStore';
@@ -29,6 +30,7 @@ import { resolveMediaUrl } from '@/lib/api';
 import { VoicePlayer } from './VoicePlayer';
 
 const QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+const MORE_EMOJIS = ['🔥', '👏', '🎉', '🤔', '💯', '😍', '🤯', '🥳', '😎', '🤝', '✅', '👀'];
 
 interface PollData {
   question: string;
@@ -117,6 +119,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   onImagePreview,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [showMoreEmojis, setShowMoreEmojis] = useState(false);
   const [viewOnceOpened, setViewOnceOpened] = useState(false);
 
   const text = message.decryptedContent ?? message.content ?? '';
@@ -501,10 +504,28 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           </div>
         )}
 
+        {/* Always-accessible Menu / Reaction Trigger (visible on touch, hover on desktop) */}
+        {!message.isDeletedForEveryone && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setMenuOpen((o) => !o);
+              setShowMoreEmojis(false);
+            }}
+            className={`absolute top-1.5 right-1.5 p-1 rounded-full bg-black/5 dark:bg-white/10 hover:bg-black/15 dark:hover:bg-white/20 text-[#54656f] dark:text-[#e9edef] transition ${
+              menuOpen ? 'opacity-100' : 'opacity-70 md:opacity-0 md:group-hover:opacity-100'
+            }`}
+            title="React & message actions"
+          >
+            <ChevronDown className="w-3.5 h-3.5" />
+          </button>
+        )}
+
         {/* Hover Quick Toolbar */}
         {!message.isDeletedForEveryone && (
           <div
-            className={`hidden group-hover:flex items-center gap-0.5 absolute -top-4 ${
+            className={`hidden md:group-hover:flex items-center gap-0.5 absolute -top-4 ${
               isOwn ? 'left-0 -translate-x-2' : 'right-0 translate-x-2'
             } bg-white dark:bg-[#2a3942] border border-gray-200 dark:border-[#3b4a54] rounded-full px-1.5 py-0.5 shadow-md z-10`}
           >
@@ -520,9 +541,12 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             ))}
             <button
               type="button"
-              onClick={() => setMenuOpen((o) => !o)}
+              onClick={() => {
+                setMenuOpen((o) => !o);
+                setShowMoreEmojis(false);
+              }}
               className="p-1 rounded-full hover:bg-gray-100 dark:hover:bg-[#3b4a54] text-[#667781] dark:text-[#e9edef]"
-              title="More actions"
+              title="More reactions & actions"
             >
               <SmilePlus className="w-3.5 h-3.5" />
             </button>
@@ -531,27 +555,61 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
 
         {/* Context Action Menu */}
         {menuOpen && (
-          <div
-            className={`absolute top-6 ${
-              isOwn ? 'right-0' : 'left-0'
-            } z-30 w-48 bg-white dark:bg-[#233138] rounded-xl shadow-xl border border-gray-200 dark:border-[#2a3942] py-1.5 text-sm`}
-            onMouseLeave={() => setMenuOpen(false)}
-          >
-            <div className="flex justify-around px-2 py-1.5 border-b border-gray-100 dark:border-[#2a3942]">
-              {QUICK_EMOJIS.map((emoji) => (
+          <>
+            <div
+              className="fixed inset-0 z-20"
+              onClick={() => {
+                setMenuOpen(false);
+                setShowMoreEmojis(false);
+              }}
+            />
+            <div
+              className={`absolute top-6 ${
+                isOwn ? 'right-0' : 'left-0'
+              } z-30 w-56 bg-white dark:bg-[#233138] rounded-xl shadow-xl border border-gray-200 dark:border-[#2a3942] py-1.5 text-sm`}
+            >
+              <div className="flex items-center justify-around px-2 py-1.5 border-b border-gray-100 dark:border-[#2a3942]">
+                {QUICK_EMOJIS.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    onClick={() => {
+                      onReact(message, emoji);
+                      setMenuOpen(false);
+                      setShowMoreEmojis(false);
+                    }}
+                    className="hover:scale-125 transition text-base"
+                  >
+                    {emoji}
+                  </button>
+                ))}
                 <button
-                  key={emoji}
                   type="button"
-                  onClick={() => {
-                    onReact(message, emoji);
-                    setMenuOpen(false);
-                  }}
-                  className="hover:scale-125 transition"
+                  onClick={() => setShowMoreEmojis((v) => !v)}
+                  className="p-1 rounded-full hover:bg-gray-100 dark:hover:bg-[#182229] text-[#667781] dark:text-[#aebac1]"
+                  title="More emojis"
                 >
-                  {emoji}
+                  <SmilePlus className="w-4 h-4" />
                 </button>
-              ))}
-            </div>
+              </div>
+              {showMoreEmojis && (
+                <div className="grid grid-cols-6 gap-1 px-2 py-2 border-b border-gray-100 dark:border-[#2a3942]">
+                  {MORE_EMOJIS.map((emoji) => (
+                    <button
+                      key={emoji}
+                      type="button"
+                      onClick={() => {
+                        onReact(message, emoji);
+                        setMenuOpen(false);
+                        setShowMoreEmojis(false);
+                      }}
+                      className="hover:scale-125 transition text-base py-0.5"
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              )}
             <button
               type="button"
               onClick={() => {
@@ -650,7 +708,8 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                 <Trash2 className="w-4 h-4" /> Delete for everyone
               </button>
             )}
-          </div>
+            </div>
+          </>
         )}
       </div>
     </div>

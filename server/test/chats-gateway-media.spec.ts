@@ -81,7 +81,7 @@ describe('Chats, Real-Time Messaging, Gateway & Media Suite', () => {
 
   const mockPrismaService: any = {
     user: { findUnique: jest.fn() },
-    userProfile: { upsert: jest.fn() },
+    userProfile: { upsert: jest.fn(), updateMany: jest.fn() },
     blockedUser: { findFirst: jest.fn() },
     conversation: {
       findFirst: jest.fn(),
@@ -101,6 +101,7 @@ describe('Chats, Real-Time Messaging, Gateway & Media Suite', () => {
       findUnique: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
       count: jest.fn(),
     },
     messageReceipt: {
@@ -403,6 +404,31 @@ describe('Chats, Real-Time Messaging, Gateway & Media Suite', () => {
       });
       const forwarded = await chatsService.forwardMessage('u1', 'msg-1', 'conv-2');
       expect(forwarded.forwardedFromId).toBe('msg-1');
+
+      // Mark as read updates earlier unread messages and resets unreadCount
+      mockPrismaService.message.findUnique.mockResolvedValueOnce({
+        id: 'msg-1',
+        conversationId: 'conv-1',
+        senderId: 'u1',
+        createdAt: new Date('2026-01-01T00:00:00Z'),
+        readAt: null,
+        deliveredAt: null,
+      });
+      mockPrismaService.messageReceipt.upsert.mockResolvedValueOnce({
+        id: 'rec-1',
+        timestamp: new Date('2026-01-01T00:01:00Z'),
+      });
+      const readRes = await chatsService.markAsRead('u2', 'conv-1', 'msg-1');
+      expect(readRes.status).toBe('READ');
+      expect(mockPrismaService.message.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            conversationId: 'conv-1',
+            senderId: { not: 'u2' },
+            readAt: null,
+          }),
+        }),
+      );
 
       // Delete for me stores in Redis and filters getMessages
       const delForMe = await chatsService.deleteMessage('u2', 'msg-1', false);

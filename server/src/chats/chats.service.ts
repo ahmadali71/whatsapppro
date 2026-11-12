@@ -155,6 +155,30 @@ export class ChatsService {
     const items = hasNextPage ? memberships.slice(0, take) : memberships;
     const nextCursor = hasNextPage ? items[items.length - 1].id : undefined;
 
+    // Best-effort presence heartbeat and delivery confirmation for serverless HTTP polling
+    const convIds = items.map((m) => m.conversationId);
+    const now = new Date();
+    try {
+      await Promise.all([
+        this.prisma.userProfile.updateMany({
+          where: { userId },
+          data: { isOnline: true, lastSeen: now },
+        }),
+        convIds.length > 0
+          ? this.prisma.message.updateMany({
+              where: {
+                conversationId: { in: convIds },
+                senderId: { not: userId },
+                deliveredAt: null,
+              },
+              data: { deliveredAt: now },
+            })
+          : Promise.resolve(),
+      ]);
+    } catch {
+      // Non-fatal in serverless or test mocks
+    }
+
     return {
       items: items.map((m) => ({
         ...m.conversation,
@@ -391,8 +415,25 @@ export class ChatsService {
     const slice = hasNextPage ? messages.slice(0, take) : messages;
     const nextCursor = hasNextPage ? slice[slice.length - 1].id : undefined;
 
+    const undeliveredIds = slice
+      .filter((m) => m.senderId !== userId && !m.deliveredAt)
+      .map((m) => m.id);
+    const deliveryNow = undeliveredIds.length > 0 ? new Date() : null;
+    if (deliveryNow && undeliveredIds.length > 0) {
+      try {
+        await this.prisma.message.updateMany({
+          where: { id: { in: undeliveredIds }, deliveredAt: null },
+          data: { deliveredAt: deliveryNow },
+        });
+      } catch {
+        // Non-fatal in serverless or test mocks
+      }
+    }
+
     const items = slice.map((m) => ({
       ...m,
+      deliveredAt:
+        m.deliveredAt ?? (deliveryNow && undeliveredIds.includes(m.id) ? deliveryNow : m.deliveredAt),
       isStarred: m.starredBy.length > 0 || m.isStarred,
       isPinned: pinnedSet.has(m.id),
     }));
@@ -972,18 +1013,56 @@ export class ChatsService {
       });
     }
 
+    // Mark all earlier unread messages from other participants in this conversation as read too
+    try {
+      await Promise.all([
+        this.prisma.message.updateMany({
+          where: {
+            conversationId,
+            senderId: { not: userId },
+            createdAt: { lte: msg.createdAt },
+            readAt: null,
+          },
+          data: { readAt: now },
+        }),
+        this.prisma.message.updateMany({
+          where: {
+            conversationId,
+            senderId: { not: userId },
+            createdAt: { lte: msg.createdAt },
+            deliveredAt: null,
+          },
+          data: { deliveredAt: now },
+        }),
+      ]);
+    } catch {
+      // Non-fatal in serverless or test mocks
+    }
+
     await this.prisma.conversationMember.updateMany({
       where: { conversationId, userId },
       data: { unreadCount: 0, lastReadMessageId: messageId },
     });
 
-    return {
+    const payload = {
       conversationId,
       messageId,
       userId,
       status: ReceiptStatus.READ,
       timestamp: receipt.timestamp,
     };
+
+    try {
+      this.gatewayService.broadcastToConversation(
+        conversationId,
+        'message_receipt',
+        payload,
+      );
+    } catch {
+      // Non-fatal in serverless or when socket gateway is unavailable
+    }
+
+    return payload;
   }
 
   async updateUnreadCount(conversationId: string, userId: string) {

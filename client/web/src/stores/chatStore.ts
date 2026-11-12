@@ -254,6 +254,8 @@ function upsertMessage(
   );
 }
 
+const lastMarkedReadByConv = new Map<string, string>();
+
 export const useChatStore = create<ChatState>((set, get) => ({
   conversations: [],
   activeConversationId: null,
@@ -329,20 +331,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const list = Array.isArray(raw) ? raw : raw?.items || raw?.conversations || [];
 
       const onlineMap = { ...get().onlineUsers };
+      const nowMs = Date.now();
       const decryptedList = await Promise.all(
         list.map(async (conv) => {
           socketManager.joinConversation(conv.id);
           conv.members?.forEach((m) => {
             socketManager.emit(SocketEvents.PRESENCE_SUBSCRIBE, { userId: m.userId }, false);
-            if (m.user && !(m.userId in onlineMap)) {
-              onlineMap[m.userId] = { isOnline: false };
+            if (m.user) {
+              const profile = (
+                m.user as User & { profile?: { isOnline?: boolean; lastSeen?: string | null } }
+              ).profile;
+              if (profile) {
+                const lastSeenMs = profile.lastSeen ? new Date(profile.lastSeen).getTime() : 0;
+                const recentlyActive = lastSeenMs > 0 && nowMs - lastSeenMs < 60_000;
+                onlineMap[m.userId] = {
+                  isOnline: Boolean(profile.isOnline && (recentlyActive || socketManager.isConnected)),
+                  lastSeen: profile.lastSeen || undefined,
+                };
+              } else if (!(m.userId in onlineMap)) {
+                onlineMap[m.userId] = { isOnline: false };
+              }
             }
           });
+          const membershipUnread = (
+            conv as ConversationWithMeta & { membership?: { unreadCount?: number } }
+          ).membership?.unreadCount;
+          const unreadCount =
+            typeof membershipUnread === 'number' ? membershipUnread : conv.unreadCount ?? 0;
           if (conv.lastMessage) {
             const dec = await maybeDecryptMessage(conv.lastMessage);
-            return { ...conv, lastMessage: dec };
+            return { ...conv, unreadCount, lastMessage: dec };
           }
-          return conv;
+          return { ...conv, unreadCount };
         }),
       );
 
@@ -401,6 +421,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
               isLoadingMessages: false,
             }),
       }));
+
+      if (
+        !loadMore &&
+        get().activeConversationId === conversationId &&
+        (typeof document === 'undefined' || document.visibilityState === 'visible')
+      ) {
+        get().markConversationRead(conversationId);
+      }
     } catch {
       if (!silent) {
         set({ isLoadingMessages: false });
@@ -734,19 +762,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   editMessage: async (messageId, conversationId, newContent) => {
-    const res = await api.patch(`/messages/${messageId}`, { content: newContent });
-    const updated = unwrapData<Message>(res.data);
-    set((state) => ({
-      editingMessage: null,
-      messagesByConv: {
-        ...state.messagesByConv,
-        [conversationId]: (state.messagesByConv[conversationId] || []).map((m) =>
-          m.id === messageId
-            ? { ...m, ...updated, content: newContent, decryptedContent: newContent, isEdited: true }
-            : m,
-        ),
-      },
-    }));
+    if (messageId.startsWith('temp-')) {
+      toast.error('Please wait until the message finishes sending');
+      return;
+    }
+    try {
+      const res = await api.patch(`/messages/${messageId}`, { content: newContent });
+      const updated = unwrapData<Message>(res.data);
+      set((state) => ({
+        editingMessage: null,
+        messagesByConv: {
+          ...state.messagesByConv,
+          [conversationId]: (state.messagesByConv[conversationId] || []).map((m) =>
+            m.id === messageId
+              ? { ...m, ...updated, content: newContent, decryptedContent: newContent, isEdited: true }
+              : m,
+          ),
+        },
+      }));
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to edit message'));
+    }
   },
 
   votePoll: async (messageId, conversationId, optionId) => {
@@ -771,28 +807,49 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   deleteMessage: async (messageId, conversationId, deleteForEveryone) => {
-    await api.delete(`/messages/${messageId}`, {
-      params: { deleteForEveryone },
-    });
-    set((state) => ({
-      messagesByConv: {
-        ...state.messagesByConv,
-        [conversationId]: deleteForEveryone
-          ? (state.messagesByConv[conversationId] || []).map((m) =>
-              m.id === messageId
-                ? { ...m, isDeletedForEveryone: true, content: null, decryptedContent: undefined }
-                : m,
-            )
-          : (state.messagesByConv[conversationId] || []).filter((m) => m.id !== messageId),
-      },
-    }));
+    if (messageId.startsWith('temp-')) {
+      set((state) => ({
+        messagesByConv: {
+          ...state.messagesByConv,
+          [conversationId]: (state.messagesByConv[conversationId] || []).filter((m) => m.id !== messageId),
+        },
+      }));
+      return;
+    }
+    try {
+      await api.delete(`/messages/${messageId}`, {
+        params: { deleteForEveryone },
+      });
+      set((state) => ({
+        messagesByConv: {
+          ...state.messagesByConv,
+          [conversationId]: deleteForEveryone
+            ? (state.messagesByConv[conversationId] || []).map((m) =>
+                m.id === messageId
+                  ? { ...m, isDeletedForEveryone: true, content: null, decryptedContent: undefined }
+                  : m,
+              )
+            : (state.messagesByConv[conversationId] || []).filter((m) => m.id !== messageId),
+        },
+      }));
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to delete message'));
+    }
   },
 
   toggleReaction: async (messageId, conversationId, emoji) => {
     const userId = useAuthStore.getState().user?.id;
     if (!userId) return;
+    if (messageId.startsWith('temp-')) {
+      toast.error('Please wait until the message finishes sending');
+      return;
+    }
 
-    await api.post(`/messages/${messageId}/reactions`, { emoji });
+    const prevList = get().messagesByConv[conversationId] || [];
+    const targetMsg = prevList.find((m) => m.id === messageId);
+    const prevReactions = targetMsg?.reactions || [];
+
+    // Optimistic toggle matching backend unique key (messageId, userId, emoji)
     set((state) => ({
       messagesByConv: {
         ...state.messagesByConv,
@@ -803,73 +860,122 @@ export const useChatStore = create<ChatState>((set, get) => ({
           const nextReactions = hasSame
             ? existing.filter((r) => !(r.userId === userId && r.emoji === emoji))
             : [
-                ...existing.filter((r) => r.userId !== userId),
+                ...existing,
                 { id: `react-${Date.now()}`, messageId, userId, emoji, createdAt: new Date().toISOString() },
               ];
           return { ...m, reactions: nextReactions };
         }),
       },
     }));
+
+    try {
+      await api.post(`/messages/${messageId}/reactions`, { emoji });
+    } catch (err) {
+      set((state) => ({
+        messagesByConv: {
+          ...state.messagesByConv,
+          [conversationId]: (state.messagesByConv[conversationId] || []).map((m) =>
+            m.id === messageId ? { ...m, reactions: prevReactions } : m,
+          ),
+        },
+      }));
+      toast.error(extractErrorMessage(err, 'Failed to send reaction'));
+    }
   },
 
   toggleStar: async (messageId, conversationId, currentlyStarred) => {
-    if (currentlyStarred) {
-      await api.delete(`/messages/${messageId}/star`);
-    } else {
-      await api.post(`/messages/${messageId}/star`);
+    if (messageId.startsWith('temp-')) {
+      toast.error('Please wait until the message finishes sending');
+      return;
     }
-    set((state) => ({
-      messagesByConv: {
-        ...state.messagesByConv,
-        [conversationId]: (state.messagesByConv[conversationId] || []).map((m) =>
-          m.id === messageId ? { ...m, isStarred: !currentlyStarred } : m,
-        ),
-      },
-    }));
+    try {
+      if (currentlyStarred) {
+        await api.delete(`/messages/${messageId}/star`);
+      } else {
+        await api.post(`/messages/${messageId}/star`);
+      }
+      set((state) => ({
+        messagesByConv: {
+          ...state.messagesByConv,
+          [conversationId]: (state.messagesByConv[conversationId] || []).map((m) =>
+            m.id === messageId ? { ...m, isStarred: !currentlyStarred } : m,
+          ),
+        },
+      }));
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to update star'));
+    }
   },
 
   forwardMessage: async (messageId, targetConversationIds) => {
-    await Promise.all(
-      targetConversationIds.map((targetId) =>
-        api.post(`/messages/${messageId}/forward`, {
-          toConversationId: targetId,
-        }),
-      ),
-    );
-    await get().fetchConversations();
+    if (messageId.startsWith('temp-')) {
+      toast.error('Please wait until the message finishes sending');
+      return;
+    }
+    try {
+      await Promise.all(
+        targetConversationIds.map((targetId) =>
+          api.post(`/messages/${messageId}/forward`, {
+            toConversationId: targetId,
+          }),
+        ),
+      );
+      await get().fetchConversations();
+      toast.success('Message forwarded');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to forward message'));
+    }
   },
 
   archiveConversation: async (conversationId, archive) => {
-    if (archive) {
-      await api.post(`/chats/${conversationId}/archive`);
-    } else {
-      await api.delete(`/chats/${conversationId}/archive`);
+    try {
+      if (archive) {
+        await api.post(`/chats/${conversationId}/archive`);
+      } else {
+        await api.delete(`/chats/${conversationId}/archive`);
+      }
+      set((state) => ({
+        conversations: state.conversations.map((c) =>
+          c.id === conversationId ? { ...c, isArchived: archive } : c,
+        ),
+      }));
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to update archive state'));
     }
-    set((state) => ({
-      conversations: state.conversations.map((c) =>
-        c.id === conversationId ? { ...c, isArchived: archive } : c,
-      ),
-    }));
   },
 
   muteConversation: async (conversationId, muted, mutedUntil = null) => {
-    await api.patch(`/settings/notifications/${conversationId}`, {
-      isMuted: muted,
-      mutedUntil,
-    });
-    set((state) => ({
-      conversations: state.conversations.map((c) =>
-        c.id === conversationId ? { ...c, isMuted: muted, mutedUntil } : c,
-      ),
-    }));
+    try {
+      await api.patch(`/settings/notifications/${conversationId}`, {
+        isMuted: muted,
+        mutedUntil,
+      });
+      set((state) => ({
+        conversations: state.conversations.map((c) =>
+          c.id === conversationId ? { ...c, isMuted: muted, mutedUntil } : c,
+        ),
+      }));
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to update mute setting'));
+    }
   },
 
   markConversationRead: (conversationId) => {
     const msgs = get().messagesByConv[conversationId] || [];
     const currentUserId = useAuthStore.getState().user?.id;
-    const latestOther = [...msgs].reverse().find((m) => m.senderId !== currentUserId);
+    const latestOther = [...msgs]
+      .reverse()
+      .find((m) => m.senderId !== currentUserId && !m.id.startsWith('temp-'));
     if (latestOther) {
       socketManager.markMessageRead(latestOther.id, conversationId);
+      if (lastMarkedReadByConv.get(conversationId) !== latestOther.id) {
+        lastMarkedReadByConv.set(conversationId, latestOther.id);
+        void api
+          .post(`/chats/${conversationId}/read`, { messageId: latestOther.id })
+          .catch(() => {
+            lastMarkedReadByConv.delete(conversationId);
+          });
+      }
     }
     set((state) => ({
       conversations: state.conversations.map((c) =>
