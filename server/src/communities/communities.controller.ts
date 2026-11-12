@@ -42,6 +42,13 @@ export class CommunitiesController {
     return this.communitiesService.createCommunity(creatorId, dto);
   }
 
+  @Get()
+  @ApiOperation({ summary: 'List communities where the current user is an active member' })
+  @ApiResponse({ status: 200, description: 'List of user communities' })
+  async getUserCommunities(@CurrentUser('id') userId: string) {
+    return this.communitiesService.getUserCommunities(userId);
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get community details, members, and linked groups' })
   @ApiResponse({ status: 200, description: 'Community details' })

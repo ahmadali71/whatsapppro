@@ -21,7 +21,8 @@ import {
 } from '@whatsapp-pro/shared-types';
 import { mediaApi, statusesApi } from '@/services/api.services';
 import { useAuthStore } from '@/stores/authStore';
-import { resolveMediaUrl } from '@/lib/api';
+import { extractErrorMessage, resolveMediaUrl } from '@/lib/api';
+import { compressImageFile } from '@/lib/imageUtils';
 import { Avatar } from '@/components/common/Avatar';
 import { toast } from '@/stores/toastStore';
 
@@ -208,6 +209,7 @@ export const StatusPage: React.FC = () => {
     setSubmitting(true);
     try {
       let uploadTarget: File | Blob = mediaFile;
+      let uploadName = mediaFile.name;
       if (mediaFile.type.startsWith('image/') && canvasRef.current) {
         const blob = await new Promise<Blob | null>((resolve) =>
           canvasRef.current!.toBlob(resolve, 'image/jpeg', 0.9),
@@ -215,7 +217,17 @@ export const StatusPage: React.FC = () => {
         if (blob) uploadTarget = blob;
       }
 
-      const uploaded = await mediaApi.uploadFile(uploadTarget, 'statuses', undefined, mediaFile.name);
+      if (mediaFile.type.startsWith('image/') && mediaFile.type !== 'image/gif') {
+        uploadTarget = await compressImageFile(uploadTarget, {
+          maxDimension: 1280,
+          quality: 0.85,
+        });
+        if (!uploadName.toLowerCase().endsWith('.jpg') && uploadTarget.type === 'image/jpeg') {
+          uploadName = uploadName.replace(/\.[^.]+$/, '') + '.jpg';
+        }
+      }
+
+      const uploaded = await mediaApi.uploadFile(uploadTarget, 'statuses', undefined, uploadName);
       await statusesApi.createStatus({
         contentType: mediaFile.type.startsWith('video/')
           ? StatusContentType.VIDEO
@@ -231,7 +243,7 @@ export const StatusPage: React.FC = () => {
       await loadStatuses();
       toast.success('Media status published!');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to upload status');
+      toast.error(extractErrorMessage(err, 'Failed to upload status'));
     } finally {
       setSubmitting(false);
     }

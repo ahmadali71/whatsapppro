@@ -128,6 +128,100 @@ export class CommunitiesService {
         announcementConversationId: announcementConversation.id,
         groups: [],
       };
+    }, { maxWait: 10000, timeout: 15000 });
+  }
+
+  async getUserCommunities(userId: string) {
+    const communities = await this.prisma.community.findMany({
+      where: {
+        deletedAt: null,
+        members: {
+          some: { userId, isActive: true },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        members: {
+          where: { isActive: true },
+          include: {
+            user: {
+              select: {
+                id: true,
+                displayName: true,
+                avatarUrl: true,
+                phoneNumber: true,
+                username: true,
+              },
+            },
+          },
+          orderBy: { joinedAt: 'asc' },
+        },
+      },
+    });
+
+    if (communities.length === 0) {
+      return [];
+    }
+
+    const configKeys = communities.map(
+      (c) => `${COMMUNITY_GROUPS_CONFIG_PREFIX}${c.id}`,
+    );
+
+    const configs = await this.prisma.systemConfig.findMany({
+      where: { key: { in: configKeys } },
+    });
+
+    const metaByCommunityId = new Map<
+      string,
+      { groupIds: string[]; announcementConversationId?: string }
+    >();
+    const allGroupIds = new Set<string>();
+
+    for (const cfg of configs ?? []) {
+      const communityId = cfg.key.slice(COMMUNITY_GROUPS_CONFIG_PREFIX.length);
+      const raw = (cfg.value ?? {}) as {
+        groupIds?: unknown;
+        announcementConversationId?: unknown;
+      };
+      const groupIds = Array.isArray(raw.groupIds)
+        ? raw.groupIds.filter((id): id is string => typeof id === 'string')
+        : [];
+      for (const gid of groupIds) {
+        allGroupIds.add(gid);
+      }
+      metaByCommunityId.set(communityId, {
+        groupIds,
+        announcementConversationId:
+          typeof raw.announcementConversationId === 'string'
+            ? raw.announcementConversationId
+            : undefined,
+      });
+    }
+
+    const groupsList =
+      allGroupIds.size > 0
+        ? await this.prisma.group.findMany({
+            where: { id: { in: Array.from(allGroupIds) }, deletedAt: null },
+            include: {
+              _count: { select: { members: true } },
+              conversations: { select: { id: true } },
+            },
+          })
+        : [];
+
+    const groupById = new Map(groupsList.map((g) => [g.id, g]));
+
+    return communities.map((community) => {
+      const meta = metaByCommunityId.get(community.id);
+      const linkedGroups = (meta?.groupIds ?? [])
+        .map((gid) => groupById.get(gid))
+        .filter((g): g is NonNullable<typeof g> => Boolean(g));
+
+      return {
+        ...community,
+        announcementConversationId: meta?.announcementConversationId,
+        groups: linkedGroups,
+      };
     });
   }
 
@@ -225,17 +319,20 @@ export class CommunitiesService {
     }
 
     const now = new Date();
-    await this.prisma.$transaction(async (tx) => {
-      await tx.community.update({
-        where: { id: communityId },
-        data: { deletedAt: now, inviteLink: null },
-      });
+    await this.prisma.$transaction(
+      async (tx) => {
+        await tx.community.update({
+          where: { id: communityId },
+          data: { deletedAt: now, inviteLink: null },
+        });
 
-      await tx.communityMember.updateMany({
-        where: { communityId, isActive: true },
-        data: { isActive: false },
-      });
-    });
+        await tx.communityMember.updateMany({
+          where: { communityId, isActive: true },
+          data: { isActive: false },
+        });
+      },
+      { maxWait: 10000, timeout: 15000 },
+    );
 
     return { deleted: true, communityId };
   }

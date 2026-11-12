@@ -79,8 +79,12 @@ export class MediaController {
       file.mimetype !== 'image/gif' &&
       compress !== 'false'
     ) {
-      bufferToUpload = await this.mediaService.compressImage(file.buffer);
-      mimeTypeToUpload = 'image/webp';
+      const compressed = await this.mediaService.compressImage(
+        file.buffer,
+        file.mimetype,
+      );
+      bufferToUpload = compressed.buffer;
+      mimeTypeToUpload = compressed.mimeType;
     }
 
     const { key, url } = await this.mediaService.uploadFileWithKey(

@@ -15,6 +15,7 @@ import {
   LogOut,
   Check,
   Edit3,
+  Camera,
 } from 'lucide-react';
 import {
   ConversationType,
@@ -25,10 +26,11 @@ import {
   User,
 } from '@whatsapp-pro/shared-types';
 import { ConversationWithMeta, LocalMessage, useChatStore } from '@/stores/chatStore';
-import { groupsApi, privacyApi, reportsApi } from '@/services/api.services';
+import { groupsApi, mediaApi, privacyApi, reportsApi } from '@/services/api.services';
 import { e2eeManager } from '@/lib/e2ee';
-import { resolveMediaUrl } from '@/lib/api';
+import { extractErrorMessage, resolveMediaUrl } from '@/lib/api';
 import { Avatar } from '@/components/common/Avatar';
+import { ImageCropModal } from '@/components/common/ImageCropModal';
 import { toast } from '@/stores/toastStore';
 
 interface ConversationInfoDrawerProps {
@@ -65,6 +67,7 @@ export const ConversationInfoDrawer: React.FC<ConversationInfoDrawerProps> = ({
   const [addMemberOpen, setAddMemberOpen] = useState(false);
   const [memberSearch, setMemberSearch] = useState('');
   const [searchResults, setSearchResults] = useState<User[]>([]);
+  const [cropGroupFile, setCropGroupFile] = useState<File | null>(null);
 
   // Disappearing timeout
   const [disappearingTimeout, setDisappearingTimeout] = useState<number>(
@@ -121,6 +124,20 @@ export const ConversationInfoDrawer: React.FC<ConversationInfoDrawerProps> = ({
       toast.success('Group info updated');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to update group');
+    }
+  };
+
+  const handleGroupAvatarCropConfirm = async (croppedBlob: Blob) => {
+    setCropGroupFile(null);
+    if (!conversation.groupId) return;
+    try {
+      const up = await mediaApi.uploadFile(croppedBlob, 'groups', undefined, 'group-avatar.jpg');
+      const updated = await groupsApi.updateGroup(conversation.groupId, { avatarUrl: up.url });
+      setGroupDetails(updated);
+      await fetchConversations();
+      toast.success('Group icon updated');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to update group icon'));
     }
   };
 
@@ -266,12 +283,36 @@ export const ConversationInfoDrawer: React.FC<ConversationInfoDrawerProps> = ({
       <div className="flex-1 overflow-y-auto space-y-2.5 pb-6">
         {/* Profile Card */}
         <div className="bg-white dark:bg-[#202c33] p-6 flex flex-col items-center text-center">
-          <Avatar
-            src={isGroup ? groupDetails?.avatarUrl : otherMember?.avatarUrl}
-            name={title}
-            size="xl"
-            isGroup={isGroup}
-          />
+          {isGroup && isAdmin ? (
+            <label className="relative cursor-pointer group">
+              <Avatar
+                src={groupDetails?.avatarUrl}
+                name={title}
+                size="xl"
+                isGroup
+              />
+              <span className="absolute bottom-0 right-0 w-8 h-8 rounded-full bg-[#00A884] text-white flex items-center justify-center shadow">
+                <Camera className="w-4 h-4" />
+              </span>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = '';
+                  if (file) setCropGroupFile(file);
+                }}
+                className="hidden"
+              />
+            </label>
+          ) : (
+            <Avatar
+              src={isGroup ? groupDetails?.avatarUrl : otherMember?.avatarUrl}
+              name={title}
+              size="xl"
+              isGroup={isGroup}
+            />
+          )}
           {editingGroupInfo ? (
             <div className="w-full mt-4 space-y-2">
               <input
@@ -711,6 +752,13 @@ export const ConversationInfoDrawer: React.FC<ConversationInfoDrawerProps> = ({
           </form>
         </div>
       )}
+      <ImageCropModal
+        file={cropGroupFile}
+        shape="circle"
+        title="Crop Group Icon"
+        onCancel={() => setCropGroupFile(null)}
+        onConfirm={(blob) => void handleGroupAvatarCropConfirm(blob)}
+      />
     </aside>
   );
 };

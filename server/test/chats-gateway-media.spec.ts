@@ -457,7 +457,10 @@ describe('Chats, Real-Time Messaging, Gateway & Media Suite', () => {
       expect(mediaService.resolveCategoryFromMime('audio/ogg')).toBe('voice');
       expect(mediaService.resolveCategoryFromMime('application/pdf')).toBe('document');
 
-      jest.spyOn(mediaService, 'compressImage').mockResolvedValue(Buffer.from('webp-bytes'));
+      jest.spyOn(mediaService, 'compressImage').mockResolvedValue({
+        buffer: Buffer.from('webp-bytes'),
+        mimeType: 'image/webp',
+      });
       jest.spyOn(mediaService, 'uploadFileWithKey').mockResolvedValue({
         key: 'messages/test.webp',
         url: 'https://test-bucket.s3.us-east-1.amazonaws.com/messages/test.webp',
@@ -476,6 +479,15 @@ describe('Chats, Real-Time Messaging, Gateway & Media Suite', () => {
       expect(uploaded.category).toBe('image');
       expect(uploaded.mimeType).toBe('image/webp');
       expect(uploaded.key).toBe('messages/test.webp');
+
+      // Fallback preserves original MIME type when sharp fails on invalid image bytes
+      jest.restoreAllMocks();
+      const rawBytes = Buffer.from('not-a-real-image');
+      const fallbackCompressed = await mediaService.compressImage(rawBytes, 'image/png');
+      expect(fallbackCompressed).toEqual({
+        buffer: rawBytes,
+        mimeType: 'image/png',
+      });
     });
 
     it('falls back to local disk storage in non-production when S3 credentials are not configured', async () => {

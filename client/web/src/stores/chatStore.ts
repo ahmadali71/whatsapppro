@@ -11,10 +11,12 @@ import {
   User,
 } from '@whatsapp-pro/shared-types';
 import { api, extractErrorMessage, unwrapData } from '@/lib/api';
+import { compressImageFile } from '@/lib/imageUtils';
 import { socketManager } from '@/lib/socket';
 import { e2eeManager } from '@/lib/e2ee';
 import { mediaApi } from '@/services/api.services';
 import { useAuthStore } from './authStore';
+import { toast } from './toastStore';
 
 export interface ConversationWithMeta extends Omit<Conversation, 'lastMessage'> {
   group?: Group | null;
@@ -132,6 +134,7 @@ interface ChatState {
 
 const PINNED_CONV_KEY = 'wp_pinned_convs';
 const PINNED_MSG_KEY = 'wp_pinned_msgs';
+const pendingMediaByTempId = new Map<string, PendingAttachmentPayload>();
 
 function loadPinnedConvs(): string[] {
   try {
@@ -565,7 +568,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   sendMediaMessage: async (conversationId, attachment) => {
     const currentUser = useAuthStore.getState().user;
-    const tempId = `temp-media-${Date.now()}`;
+    const tempId = `temp-media-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const previewUrl = URL.createObjectURL(attachment.file);
 
     const optimistic: LocalMessage = {
@@ -601,6 +604,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ],
     };
 
+    pendingMediaByTempId.set(tempId, attachment);
+
     set((state) => ({
       messagesByConv: {
         ...state.messagesByConv,
@@ -609,8 +614,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
 
     try {
+      let uploadBlob: File | Blob = attachment.file;
+      let uploadFileName = attachment.fileName;
+      if (
+        attachment.messageType === MessageType.IMAGE &&
+        attachment.file.type !== 'image/gif'
+      ) {
+        uploadBlob = await compressImageFile(attachment.file, {
+          maxDimension: 1600,
+          quality: 0.85,
+        });
+        if (uploadFileName && !uploadFileName.toLowerCase().endsWith('.jpg') && uploadBlob.type === 'image/jpeg') {
+          uploadFileName = uploadFileName.replace(/\.[^.]+$/, '') + '.jpg';
+        }
+        pendingMediaByTempId.set(tempId, {
+          ...attachment,
+          file: uploadBlob,
+          fileName: uploadFileName,
+        });
+      }
+
       const uploaded = await mediaApi.uploadFile(
-        attachment.file,
+        uploadBlob,
         'chat-media',
         (pct) => {
           set((state) => ({
@@ -622,7 +647,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             },
           }));
         },
-        attachment.fileName,
+        uploadFileName,
       );
 
       const res = await api.post(`/chats/${conversationId}/messages`, {
@@ -630,12 +655,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         content: attachment.caption || undefined,
         isViewOnce: attachment.isViewOnce,
         attachmentUrl: uploaded.url,
-        attachmentName: uploaded.fileName || attachment.fileName,
-        attachmentSize: uploaded.fileSize || attachment.file.size,
-        mimeType: uploaded.mimeType || attachment.file.type,
+        attachmentName: uploaded.fileName || uploadFileName,
+        attachmentSize: uploaded.fileSize || uploadBlob.size,
+        mimeType: uploaded.mimeType || uploadBlob.type,
       });
 
       const saved = unwrapData<Message>(res.data);
+      pendingMediaByTempId.delete(tempId);
       const normalized: LocalMessage = {
         ...saved,
         decryptedContent: saved.content || attachment.caption,
@@ -660,7 +686,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ),
         };
       });
-    } catch {
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to send media'));
       set((state) => ({
         messagesByConv: {
           ...state.messagesByConv,
@@ -669,12 +696,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ),
         },
       }));
+    } finally {
+      URL.revokeObjectURL(previewUrl);
     }
   },
 
   retryMessage: async (conversationId, tempId) => {
     const msg = (get().messagesByConv[conversationId] || []).find((m) => m.id === tempId);
-    if (!msg) return;
+    const pendingMedia = pendingMediaByTempId.get(tempId);
+    pendingMediaByTempId.delete(tempId);
+    if (!msg && !pendingMedia) return;
+
     // Remove failed message and re-send
     set((state) => ({
       messagesByConv: {
@@ -682,6 +714,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         [conversationId]: (state.messagesByConv[conversationId] || []).filter((m) => m.id !== tempId),
       },
     }));
+
+    if (pendingMedia) {
+      await get().sendMediaMessage(conversationId, pendingMedia);
+      return;
+    }
+
+    if (!msg) return;
     await get().sendMessage(conversationId, {
       messageType: msg.messageType,
       content: msg.decryptedContent || msg.content || undefined,

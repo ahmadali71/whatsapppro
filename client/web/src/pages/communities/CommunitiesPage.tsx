@@ -1,13 +1,32 @@
 import React, { useEffect, useState } from 'react';
-import { Users, Plus, X, Trash2, Link2, FolderPlus } from 'lucide-react';
-import { ConversationType } from '@whatsapp-pro/shared-types';
-import { communitiesApi, CommunityWithGroups } from '@/services/api.services';
+import { useNavigate } from 'react-router-dom';
+import {
+  Users,
+  Plus,
+  X,
+  Trash2,
+  Link2,
+  FolderPlus,
+  Camera,
+  UserPlus,
+  Copy,
+  Megaphone,
+  Search,
+} from 'lucide-react';
+import { ConversationType, MemberRole, User } from '@whatsapp-pro/shared-types';
+import { communitiesApi, CommunityWithGroups, mediaApi } from '@/services/api.services';
+import { useAuthStore } from '@/stores/authStore';
 import { useChatStore } from '@/stores/chatStore';
+import { extractErrorMessage } from '@/lib/api';
 import { Avatar } from '@/components/common/Avatar';
+import { ImageCropModal } from '@/components/common/ImageCropModal';
 import { toast } from '@/stores/toastStore';
 
 export const CommunitiesPage: React.FC = () => {
-  const { conversations, setActiveConversation } = useChatStore();
+  const navigate = useNavigate();
+  const { user } = useAuthStore();
+  const { conversations, setActiveConversation, fetchConversations, searchUsers } = useChatStore();
+
   const [communities, setCommunities] = useState<CommunityWithGroups[]>([]);
   const [selected, setSelected] = useState<CommunityWithGroups | null>(null);
   const [loading, setLoading] = useState(true);
@@ -15,21 +34,29 @@ export const CommunitiesPage: React.FC = () => {
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [createAvatarUrl, setCreateAvatarUrl] = useState('');
   const [creating, setCreating] = useState(false);
 
+  const [cropFile, setCropFile] = useState<File | null>(null);
+  const [cropTarget, setCropTarget] = useState<'create' | 'edit'>('create');
+
   const [linkGroupModalOpen, setLinkGroupModalOpen] = useState(false);
+  const [addMemberOpen, setAddMemberOpen] = useState(false);
+  const [memberQuery, setMemberQuery] = useState('');
+  const [memberResults, setMemberResults] = useState<User[]>([]);
+  const [searchingMembers, setSearchingMembers] = useState(false);
 
   const loadCommunities = async () => {
     setLoading(true);
     try {
       const list = await communitiesApi.listCommunities();
       setCommunities(list);
-      if (selected) {
-        const refreshed = list.find((c) => c.id === selected.id);
-        if (refreshed) setSelected(refreshed);
-      }
-    } catch {
-      // Ignore if backend returns empty
+      setSelected((prev) => {
+        if (!prev) return null;
+        return list.find((c) => c.id === prev.id) || prev;
+      });
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to load communities'));
     } finally {
       setLoading(false);
     }
@@ -39,6 +66,41 @@ export const CommunitiesPage: React.FC = () => {
     void loadCommunities();
   }, []);
 
+  const refreshSelected = async (communityId: string) => {
+    try {
+      const updated = await communitiesApi.getCommunity(communityId);
+      setSelected(updated);
+      setCommunities((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to load community details'));
+    }
+  };
+
+  const handleCropConfirm = async (croppedBlob: Blob) => {
+    setCropFile(null);
+    try {
+      const up = await mediaApi.uploadFile(
+        croppedBlob,
+        'communities',
+        undefined,
+        'community-icon.jpg',
+      );
+      if (cropTarget === 'create') {
+        setCreateAvatarUrl(up.url);
+        toast.success('Community icon ready');
+      } else if (selected) {
+        const updated = await communitiesApi.updateCommunity(selected.id, { avatarUrl: up.url });
+        setSelected((prev) => (prev ? { ...prev, ...updated, avatarUrl: up.url } : updated));
+        setCommunities((prev) =>
+          prev.map((c) => (c.id === selected.id ? { ...c, avatarUrl: up.url } : c)),
+        );
+        toast.success('Community icon updated');
+      }
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to upload community icon'));
+    }
+  };
+
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
@@ -47,15 +109,18 @@ export const CommunitiesPage: React.FC = () => {
       const created = await communitiesApi.createCommunity({
         name: name.trim(),
         description: description.trim() || undefined,
+        avatarUrl: createAvatarUrl || undefined,
       });
       setCreateOpen(false);
       setName('');
       setDescription('');
+      setCreateAvatarUrl('');
       await loadCommunities();
       setSelected(created);
+      void fetchConversations({ silent: true });
       toast.success('Community created!');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to create community');
+      toast.error(extractErrorMessage(err, 'Failed to create community'));
     } finally {
       setCreating(false);
     }
@@ -65,12 +130,11 @@ export const CommunitiesPage: React.FC = () => {
     if (!selected) return;
     try {
       await communitiesApi.addGroup(selected.id, groupId);
-      const updated = await communitiesApi.getCommunity(selected.id);
-      setSelected(updated);
+      await refreshSelected(selected.id);
       setLinkGroupModalOpen(false);
       toast.success('Group added to community');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to link group');
+      toast.error(extractErrorMessage(err, 'Failed to link group'));
     }
   };
 
@@ -78,11 +142,10 @@ export const CommunitiesPage: React.FC = () => {
     if (!selected) return;
     try {
       await communitiesApi.removeGroup(selected.id, groupId);
-      const updated = await communitiesApi.getCommunity(selected.id);
-      setSelected(updated);
+      await refreshSelected(selected.id);
       toast.success('Group removed from community');
-    } catch {
-      toast.error('Failed to remove group');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to remove group'));
     }
   };
 
@@ -92,14 +155,78 @@ export const CommunitiesPage: React.FC = () => {
       setSelected(null);
       await loadCommunities();
       toast.success('Community deleted');
-    } catch {
-      toast.error('Failed to delete community');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to delete community'));
     }
+  };
+
+  const handleMemberSearch = async (q: string) => {
+    setMemberQuery(q);
+    if (q.trim().length < 2) {
+      setMemberResults([]);
+      return;
+    }
+    setSearchingMembers(true);
+    try {
+      const users = await searchUsers(q.trim());
+      setMemberResults(users);
+    } catch {
+      setMemberResults([]);
+    } finally {
+      setSearchingMembers(false);
+    }
+  };
+
+  const handleAddMember = async (targetUserId: string) => {
+    if (!selected) return;
+    try {
+      await communitiesApi.addMembers(selected.id, [targetUserId]);
+      await refreshSelected(selected.id);
+      toast.success('Member added to community');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to add member'));
+    }
+  };
+
+  const handleRemoveMember = async (targetUserId: string) => {
+    if (!selected) return;
+    try {
+      await communitiesApi.removeMember(selected.id, targetUserId);
+      await refreshSelected(selected.id);
+      toast.success('Member removed from community');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to remove member'));
+    }
+  };
+
+  const handleCopyInviteLink = async (inviteCode: string) => {
+    const url = `${window.location.origin}/join/${inviteCode}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast.success('Invite link copied to clipboard');
+    } catch {
+      toast.info(url);
+    }
+  };
+
+  const openConversation = (conversationId?: string | null) => {
+    if (!conversationId) {
+      toast.error('Conversation is unavailable right now');
+      return;
+    }
+    setActiveConversation(conversationId);
+    navigate('/');
   };
 
   const availableGroups = conversations
     .filter((c) => c.type === ConversationType.GROUP && c.group)
     .map((c) => c.group!);
+
+  const myCommunityRole = selected?.members?.find((m) => m.userId === user?.id)?.role;
+  const isCommunityAdmin =
+    selected?.createdBy === user?.id ||
+    myCommunityRole === MemberRole.OWNER ||
+    myCommunityRole === MemberRole.ADMIN;
 
   return (
     <div className="flex-1 flex flex-col md:flex-row h-full overflow-hidden bg-white dark:bg-[#111b21]">
@@ -142,7 +269,7 @@ export const CommunitiesPage: React.FC = () => {
                 type="button"
                 onClick={() => {
                   setSelected(c);
-                  void communitiesApi.getCommunity(c.id).then(setSelected).catch(() => {});
+                  void refreshSelected(c.id);
                 }}
                 className={`w-full flex items-center gap-3 p-3 rounded-2xl text-left transition ${
                   selected?.id === c.id
@@ -167,9 +294,31 @@ export const CommunitiesPage: React.FC = () => {
       <section className="flex-1 flex flex-col bg-[#f0f2f5] dark:bg-[#0b141a] overflow-y-auto p-6">
         {selected ? (
           <div className="max-w-2xl w-full mx-auto space-y-5">
-            <div className="bg-white dark:bg-[#202c33] rounded-2xl p-6 flex items-center justify-between gap-4 shadow-sm">
+            <div className="bg-white dark:bg-[#202c33] rounded-2xl p-6 flex flex-wrap items-center justify-between gap-4 shadow-sm">
               <div className="flex items-center gap-4">
-                <Avatar src={selected.avatarUrl} name={selected.name} size="lg" isGroup />
+                {isCommunityAdmin ? (
+                  <label className="relative cursor-pointer group shrink-0">
+                    <Avatar src={selected.avatarUrl} name={selected.name} size="lg" isGroup />
+                    <span className="absolute -bottom-1 -right-1 w-6 h-6 rounded-full bg-[#00A884] text-white flex items-center justify-center shadow">
+                      <Camera className="w-3.5 h-3.5" />
+                    </span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        e.target.value = '';
+                        if (f) {
+                          setCropTarget('edit');
+                          setCropFile(f);
+                        }
+                      }}
+                      className="hidden"
+                    />
+                  </label>
+                ) : (
+                  <Avatar src={selected.avatarUrl} name={selected.name} size="lg" isGroup />
+                )}
                 <div>
                   <h2 className="text-xl font-bold">{selected.name}</h2>
                   <p className="text-sm text-[#667781] dark:text-[#8696a0]">
@@ -177,25 +326,49 @@ export const CommunitiesPage: React.FC = () => {
                   </p>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setLinkGroupModalOpen(true)}
-                  className="px-3.5 py-2 rounded-xl bg-[#00A884] text-white text-xs font-semibold flex items-center gap-1.5"
-                >
-                  <FolderPlus className="w-4 h-4" /> Add Group
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleDeleteCommunity(selected.id)}
-                  className="p-2 rounded-xl text-red-500 hover:bg-red-500/10"
-                  title="Delete Community"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
+              <div className="flex flex-wrap items-center gap-2">
+                {selected.announcementConversationId && (
+                  <button
+                    type="button"
+                    onClick={() => openConversation(selected.announcementConversationId)}
+                    className="px-3.5 py-2 rounded-xl bg-[#00A884]/15 text-[#00A884] hover:bg-[#00A884]/25 text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <Megaphone className="w-4 h-4" /> Open Announcements
+                  </button>
+                )}
+                {selected.inviteLink && (
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyInviteLink(selected.inviteLink!)}
+                    className="px-3 py-2 rounded-xl border border-gray-200 dark:border-[#2a3942] hover:bg-gray-100 dark:hover:bg-[#2a3942] text-xs font-semibold flex items-center gap-1.5"
+                    title="Copy Community Invite Link"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> Invite Link
+                  </button>
+                )}
+                {isCommunityAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => setLinkGroupModalOpen(true)}
+                    className="px-3.5 py-2 rounded-xl bg-[#00A884] text-white text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <FolderPlus className="w-4 h-4" /> Add Group
+                  </button>
+                )}
+                {isCommunityAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteCommunity(selected.id)}
+                    className="p-2 rounded-xl text-red-500 hover:bg-red-500/10"
+                    title="Delete Community"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             </div>
 
+            {/* Linked Groups */}
             <div className="bg-white dark:bg-[#202c33] rounded-2xl p-5 shadow-sm">
               <h3 className="text-sm font-semibold mb-3">
                 Groups in this Community ({selected.groups?.length || 0})
@@ -206,34 +379,97 @@ export const CommunitiesPage: React.FC = () => {
                 </p>
               ) : (
                 <div className="divide-y divide-gray-100 dark:divide-[#2a3942]">
-                  {selected.groups.map((g) => (
-                    <div key={g.id} className="py-3 flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <Avatar src={g.avatarUrl} name={g.name} size="sm" isGroup />
-                        <div>
-                          <p className="text-sm font-medium">{g.name}</p>
-                          <p className="text-xs text-[#667781]">{g.description}</p>
+                  {selected.groups.map((g) => {
+                    const convId =
+                      g.conversations?.[0]?.id ||
+                      conversations.find((c) => c.groupId === g.id)?.id;
+                    return (
+                      <div key={g.id} className="py-3 flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <Avatar src={g.avatarUrl} name={g.name} size="sm" isGroup />
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium truncate">{g.name}</p>
+                            <p className="text-xs text-[#667781] truncate">{g.description}</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-3 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => openConversation(convId)}
+                            className="text-xs text-[#00A884] font-semibold hover:underline"
+                          >
+                            Open
+                          </button>
+                          {isCommunityAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => void handleUnlinkGroup(g.id)}
+                              className="text-xs text-red-500 hover:underline"
+                            >
+                              Remove
+                            </button>
+                          )}
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const conv = conversations.find((c) => c.groupId === g.id);
-                            if (conv) setActiveConversation(conv.id);
-                          }}
-                          className="text-xs text-[#00A884] font-semibold hover:underline"
-                        >
-                          Open
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void handleUnlinkGroup(g.id)}
-                          className="text-xs text-red-500 hover:underline"
-                        >
-                          Remove
-                        </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Community Members */}
+            <div className="bg-white dark:bg-[#202c33] rounded-2xl p-5 shadow-sm">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold">
+                  Members ({selected.members?.length || 0})
+                </h3>
+                {isCommunityAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMemberQuery('');
+                      setMemberResults([]);
+                      setAddMemberOpen(true);
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-[#00A884]/15 text-[#00A884] text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" /> Add Member
+                  </button>
+                )}
+              </div>
+              {!selected.members || selected.members.length === 0 ? (
+                <p className="text-xs text-[#667781] py-3">No active members found.</p>
+              ) : (
+                <div className="divide-y divide-gray-100 dark:divide-[#2a3942]">
+                  {selected.members.map((m) => (
+                    <div key={m.id} className="py-2.5 flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <Avatar
+                          src={m.user?.avatarUrl}
+                          name={m.user?.displayName || m.userId}
+                          size="sm"
+                        />
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium truncate">
+                            {m.user?.displayName || m.userId}
+                            {m.userId === user?.id ? ' (You)' : ''}
+                          </p>
+                          <p className="text-xs text-[#667781] truncate">
+                            {m.role}
+                            {m.user?.phoneNumber ? ` · ${m.user.phoneNumber}` : ''}
+                          </p>
+                        </div>
                       </div>
+                      {(isCommunityAdmin || m.userId === user?.id) &&
+                        m.role !== MemberRole.OWNER && (
+                          <button
+                            type="button"
+                            onClick={() => void handleRemoveMember(m.userId)}
+                            className="text-xs text-red-500 hover:underline shrink-0"
+                          >
+                            {m.userId === user?.id ? 'Leave' : 'Remove'}
+                          </button>
+                        )}
                     </div>
                   ))}
                 </div>
@@ -264,6 +500,27 @@ export const CommunitiesPage: React.FC = () => {
                 <X className="w-5 h-5 text-gray-400" />
               </button>
             </div>
+            <div className="flex justify-center mb-4">
+              <label className="relative cursor-pointer group">
+                <Avatar src={createAvatarUrl} name={name || 'C'} size="lg" isGroup />
+                <span className="absolute -bottom-1 -right-1 w-6 h-6 rounded-full bg-[#00A884] text-white flex items-center justify-center shadow">
+                  <Camera className="w-3.5 h-3.5" />
+                </span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    e.target.value = '';
+                    if (f) {
+                      setCropTarget('create');
+                      setCropFile(f);
+                    }
+                  }}
+                  className="hidden"
+                />
+              </label>
+            </div>
             <input
               type="text"
               value={name}
@@ -290,7 +547,7 @@ export const CommunitiesPage: React.FC = () => {
               <button
                 type="submit"
                 disabled={creating}
-                className="px-4 py-2 rounded-lg text-sm bg-[#00A884] text-white font-semibold"
+                className="px-4 py-2 rounded-lg text-sm bg-[#00A884] text-white font-semibold disabled:opacity-50"
               >
                 {creating ? 'Creating...' : 'Create'}
               </button>
@@ -334,6 +591,80 @@ export const CommunitiesPage: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Add Member Modal */}
+      {addMemberOpen && selected && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-white dark:bg-[#202c33] rounded-2xl max-w-md w-full p-6 shadow-xl border border-gray-200 dark:border-[#2a3942]">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-semibold text-base flex items-center gap-2">
+                <UserPlus className="w-4 h-4 text-[#00A884]" /> Add Community Member
+              </h3>
+              <button type="button" onClick={() => setAddMemberOpen(false)}>
+                <X className="w-5 h-5 text-gray-400" />
+              </button>
+            </div>
+            <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-gray-100 dark:bg-[#111b21] mb-3">
+              <Search className="w-4 h-4 text-gray-400" />
+              <input
+                type="text"
+                value={memberQuery}
+                onChange={(e) => void handleMemberSearch(e.target.value)}
+                placeholder="Search by name, @username, or phone..."
+                className="flex-1 bg-transparent text-sm focus:outline-none"
+                autoFocus
+              />
+            </div>
+            <div className="space-y-1 max-h-60 overflow-y-auto">
+              {searchingMembers && (
+                <p className="text-xs text-[#667781] text-center py-4">Searching...</p>
+              )}
+              {!searchingMembers && memberQuery.trim().length >= 2 && memberResults.length === 0 && (
+                <p className="text-xs text-[#667781] text-center py-4">No users found</p>
+              )}
+              {memberResults.map((u) => {
+                const alreadyMember = selected.members?.some((m) => m.userId === u.id);
+                return (
+                  <div
+                    key={u.id}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-[#2a3942]"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <Avatar src={u.avatarUrl} name={u.displayName} size="sm" />
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium truncate">{u.displayName}</p>
+                        <p className="text-xs text-[#667781] truncate">
+                          {u.username ? `@${u.username} · ` : ''}
+                          {u.phoneNumber}
+                        </p>
+                      </div>
+                    </div>
+                    {alreadyMember ? (
+                      <span className="text-xs text-[#667781] shrink-0">Member</span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => void handleAddMember(u.id)}
+                        className="px-3 py-1 rounded-lg bg-[#00A884] text-white text-xs font-semibold shrink-0"
+                      >
+                        Add
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ImageCropModal
+        file={cropFile}
+        shape="circle"
+        title="Crop Community Icon"
+        onCancel={() => setCropFile(null)}
+        onConfirm={(blob) => void handleCropConfirm(blob)}
+      />
     </div>
   );
 };

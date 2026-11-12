@@ -21,6 +21,10 @@ async function configureApp(
   app: NestExpressApplication,
   expressApp: express.Express,
 ): Promise<number> {
+  // Raise Express body parser limits above 100kb so inline base64 data-URI media payloads succeed
+  expressApp.use(express.json({ limit: '5mb' }));
+  expressApp.use(express.urlencoded({ limit: '5mb', extended: true }));
+
   const logger = new Logger('Bootstrap');
   const configService = app.get(ConfigService);
   const prismaService = app.get(PrismaService);
@@ -152,7 +156,11 @@ export async function getServer(): Promise<express.Express> {
     cachedInitPromise = (async () => {
       const expressApp = express();
       const adapter = new ExpressAdapter(expressApp);
-      const app = await NestFactory.create<NestExpressApplication>(AppModule, adapter);
+      const app = await NestFactory.create<NestExpressApplication>(
+        AppModule,
+        adapter,
+        { bodyParser: false },
+      );
       await configureApp(app, expressApp);
       await app.init();
       cachedExpressApp = expressApp;
@@ -170,7 +178,11 @@ async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const expressApp = express();
   const adapter = new ExpressAdapter(expressApp);
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, adapter);
+  const app = await NestFactory.create<NestExpressApplication>(
+    AppModule,
+    adapter,
+    { bodyParser: false },
+  );
   const port = await configureApp(app, expressApp);
 
   await app.listen(port);

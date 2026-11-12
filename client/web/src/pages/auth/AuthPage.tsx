@@ -13,10 +13,12 @@ import {
   Phone,
 } from 'lucide-react';
 import { COUNTRIES, CountryOption } from '@/lib/countries';
+import { extractErrorMessage } from '@/lib/api';
 import { useAuthStore } from '@/stores/authStore';
 import { mediaApi } from '@/services/api.services';
 import { toast } from '@/stores/toastStore';
 import { Avatar } from '@/components/common/Avatar';
+import { ImageCropModal } from '@/components/common/ImageCropModal';
 
 type AuthStep = 'welcome' | 'phone' | 'otp' | 'profile' | 'two_factor_challenge' | 'two_factor_setup';
 
@@ -63,6 +65,7 @@ export const AuthPage: React.FC<{ initialStep?: AuthStep }> = ({ initialStep = '
   // 2FA PIN
   const [pin, setPin] = useState('');
   const [confirmPin, setConfirmPin] = useState('');
+  const [cropFile, setCropFile] = useState<File | null>(null);
 
   useEffect(() => {
     if (isAuthenticated && !requires2FA && step !== 'profile' && step !== 'two_factor_setup') {
@@ -221,16 +224,22 @@ export const AuthPage: React.FC<{ initialStep?: AuthStep }> = ({ initialStep = '
     }
   };
 
-  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+    setCropFile(file);
+  };
+
+  const handleAvatarCropConfirm = async (croppedBlob: Blob) => {
+    setCropFile(null);
     setUploadingAvatar(true);
     try {
-      const uploaded = await mediaApi.uploadFile(file, 'avatars');
+      const uploaded = await mediaApi.uploadFile(croppedBlob, 'avatars', undefined, 'avatar.jpg');
       setAvatarUrl(uploaded.url);
       toast.success('Profile photo uploaded');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to upload avatar');
+      toast.error(extractErrorMessage(err, 'Failed to upload avatar'));
     } finally {
       setUploadingAvatar(false);
     }
@@ -744,6 +753,14 @@ export const AuthPage: React.FC<{ initialStep?: AuthStep }> = ({ initialStep = '
           )}
         </div>
       </div>
+
+      <ImageCropModal
+        file={cropFile}
+        shape="circle"
+        title="Crop Profile Photo"
+        onCancel={() => setCropFile(null)}
+        onConfirm={(blob) => void handleAvatarCropConfirm(blob)}
+      />
     </div>
   );
 };

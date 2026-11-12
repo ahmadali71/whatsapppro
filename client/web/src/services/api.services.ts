@@ -42,7 +42,6 @@ export const mediaApi = {
     formData.append('folder', folder);
 
     const res = await api.post('/media/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
       onUploadProgress: (evt) => {
         if (evt.total && onProgress) {
           onProgress(Math.round((evt.loaded / evt.total) * 100));
@@ -211,7 +210,8 @@ export const groupsApi = {
 };
 
 export interface CommunityWithGroups extends Community {
-  groups?: Group[];
+  announcementConversationId?: string | null;
+  groups?: Array<Group & { conversations?: Array<{ id: string }> }>;
   members?: Array<{ id: string; userId: string; role: MemberRole; user?: User }>;
 }
 

@@ -19,6 +19,7 @@ import {
   Monitor,
   Sun,
   Moon,
+  Loader2,
 } from 'lucide-react';
 import {
   FontSize,
@@ -36,8 +37,10 @@ import {
   StorageConversationUsage,
 } from '@/services/api.services';
 import { COUNTRIES } from '@/lib/countries';
+import { extractErrorMessage } from '@/lib/api';
 import { Avatar } from '@/components/common/Avatar';
 import { ConfirmModal } from '@/components/common/ConfirmModal';
+import { ImageCropModal } from '@/components/common/ImageCropModal';
 import { toast } from '@/stores/toastStore';
 
 type SettingsTab = 'account' | 'privacy' | 'chats' | 'notifications' | 'storage' | 'appearance';
@@ -101,6 +104,8 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTab }> = ({
   const [username, setUsername] = useState(user?.username || '');
   const [about, setAbout] = useState(user?.about || '');
   const [savingProfile, setSavingProfile] = useState(false);
+  const [cropFile, setCropFile] = useState<File | null>(null);
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
 
   // 2FA form
   const [newPin, setNewPin] = useState('');
@@ -159,15 +164,24 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTab }> = ({
     }
   };
 
-  const handleAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+    setCropFile(file);
+  };
+
+  const handleAvatarCropConfirm = async (croppedBlob: Blob) => {
+    setCropFile(null);
+    setUploadingAvatar(true);
     try {
-      const up = await mediaApi.uploadFile(file, 'avatars');
+      const up = await mediaApi.uploadFile(croppedBlob, 'avatars', undefined, 'avatar.jpg');
       await updateProfile({ avatarUrl: up.url });
       toast.success('Profile photo updated');
-    } catch {
-      toast.error('Failed to upload photo');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to upload photo'));
+    } finally {
+      setUploadingAvatar(false);
     }
   };
 
@@ -307,13 +321,26 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTab }> = ({
                     <label className="relative cursor-pointer group">
                       <Avatar src={user?.avatarUrl} name={user?.displayName} size="xl" />
                       <span className="absolute bottom-0 right-0 w-8 h-8 rounded-full bg-[#00A884] text-white flex items-center justify-center shadow">
-                        <Camera className="w-4 h-4" />
+                        {uploadingAvatar ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Camera className="w-4 h-4" />
+                        )}
                       </span>
-                      <input type="file" accept="image/*" onChange={handleAvatarChange} className="hidden" />
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={handleAvatarChange}
+                        disabled={uploadingAvatar}
+                        className="hidden"
+                      />
                     </label>
                     <div>
                       <p className="font-semibold">{user?.displayName}</p>
                       <p className="text-xs text-[#667781] font-mono">{user?.phoneNumber}</p>
+                      {uploadingAvatar && (
+                        <p className="text-[11px] text-[#00A884] mt-0.5">Uploading photo...</p>
+                      )}
                     </div>
                   </div>
 
@@ -905,6 +932,14 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTab }> = ({
             navigate('/auth', { replace: true });
           });
         }}
+      />
+
+      <ImageCropModal
+        file={cropFile}
+        shape="circle"
+        title="Crop Profile Photo"
+        onCancel={() => setCropFile(null)}
+        onConfirm={(blob) => void handleAvatarCropConfirm(blob)}
       />
     </div>
   );

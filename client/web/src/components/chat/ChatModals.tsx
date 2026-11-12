@@ -19,7 +19,9 @@ import { ConversationType, User } from '@whatsapp-pro/shared-types';
 import { ConversationWithMeta, LocalMessage, SearchResults, useChatStore } from '@/stores/chatStore';
 import { groupsApi, mediaApi } from '@/services/api.services';
 import { COUNTRIES } from '@/lib/countries';
+import { extractErrorMessage } from '@/lib/api';
 import { Avatar } from '@/components/common/Avatar';
+import { ImageCropModal } from '@/components/common/ImageCropModal';
 import { toast } from '@/stores/toastStore';
 
 export const GlobalSearchModal: React.FC<{
@@ -738,6 +740,7 @@ export const CreateGroupModal: React.FC<{
   const [searchQ, setSearchQ] = useState('');
   const [searchRes, setSearchRes] = useState<User[]>([]);
   const [creating, setCreating] = useState(false);
+  const [cropFile, setCropFile] = useState<File | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -767,14 +770,21 @@ export const CreateGroupModal: React.FC<{
     }
   };
 
-  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+    setCropFile(file);
+  };
+
+  const handleAvatarCropConfirm = async (croppedBlob: Blob) => {
+    setCropFile(null);
     try {
-      const up = await mediaApi.uploadFile(file, 'groups');
+      const up = await mediaApi.uploadFile(croppedBlob, 'groups', undefined, 'group-avatar.jpg');
       setAvatarUrl(up.url);
-    } catch {
-      toast.error('Failed to upload group icon');
+      toast.success('Group icon uploaded');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to upload group icon'));
     }
   };
 
@@ -922,6 +932,14 @@ export const CreateGroupModal: React.FC<{
           </button>
         </div>
       </form>
+
+      <ImageCropModal
+        file={cropFile}
+        shape="circle"
+        title="Crop Group Icon"
+        onCancel={() => setCropFile(null)}
+        onConfirm={(blob) => void handleAvatarCropConfirm(blob)}
+      />
     </div>
   );
 };

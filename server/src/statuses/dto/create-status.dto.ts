@@ -34,7 +34,7 @@ export class CreateStatusDto {
   })
   @IsOptional()
   @IsString()
-  @MaxLength(2048)
+  @MaxLength(4_000_000)
   contentUrl?: string;
 
   @ApiPropertyOptional({
@@ -51,7 +51,7 @@ export class CreateStatusDto {
   })
   @IsOptional()
   @IsString()
-  @MaxLength(2048)
+  @MaxLength(4_000_000)
   content?: string;
 
   @ApiPropertyOptional({ example: 'Sunset at the beach', maxLength: 500 })

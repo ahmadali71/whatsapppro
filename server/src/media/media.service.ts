@@ -258,11 +258,14 @@ export class MediaService {
    * Compress and resize an image buffer using sharp (lazy-loaded so serverless
    * environments without sharp native binaries do not crash on module load).
    */
-  async compressImage(buffer: Buffer): Promise<Buffer> {
+  async compressImage(
+    buffer: Buffer,
+    originalMimeType = 'image/jpeg',
+  ): Promise<{ buffer: Buffer; mimeType: string }> {
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const sharpLib = require('sharp') as typeof import('sharp');
-      return await sharpLib(buffer)
+      const compressed = await sharpLib(buffer)
         .rotate()
         .resize({
           width: 2048,
@@ -272,11 +275,12 @@ export class MediaService {
         })
         .webp({ quality: 82 })
         .toBuffer();
+      return { buffer: compressed, mimeType: 'image/webp' };
     } catch (error) {
       this.logger.warn(
         `sharp unavailable or failed; returning original image buffer: ${error instanceof Error ? error.message : String(error)}`,
       );
-      return buffer;
+      return { buffer, mimeType: originalMimeType };
     }
   }
 

@@ -10,6 +10,8 @@ import {
 import { CallStatus, CallType, MemberRole } from '@prisma/client';
 import { GroupsController } from '../src/groups/groups.controller';
 import { GroupsService } from '../src/groups/groups.service';
+import { CommunitiesController } from '../src/communities/communities.controller';
+import { CommunitiesService } from '../src/communities/communities.service';
 import { CallsController } from '../src/calls/calls.controller';
 import { CallsService, MAX_MESH_PARTICIPANTS } from '../src/calls/calls.service';
 import { CallsGateway } from '../src/calls/calls.gateway';
@@ -20,6 +22,7 @@ import { RedisService } from '../src/redis/redis.service';
 describe('Groups & WebRTC Calls Suite', () => {
   let groupsController: GroupsController;
   let groupsService: GroupsService;
+  let communitiesController: CommunitiesController;
   let callsController: CallsController;
   let callsService: CallsService;
   let callsGateway: CallsGateway;
@@ -30,6 +33,7 @@ describe('Groups & WebRTC Calls Suite', () => {
       create: jest.fn(),
       findUnique: jest.fn(),
       findFirst: jest.fn(),
+      findMany: jest.fn(async () => []),
       update: jest.fn(),
     },
     groupMember: {
@@ -72,6 +76,26 @@ describe('Groups & WebRTC Calls Suite', () => {
       upsert: jest.fn(),
       updateMany: jest.fn(),
       count: jest.fn(),
+    },
+    community: {
+      create: jest.fn(),
+      findUnique: jest.fn(),
+      findFirst: jest.fn(),
+      findMany: jest.fn(async () => []),
+      update: jest.fn(),
+    },
+    communityMember: {
+      createMany: jest.fn(),
+      findUnique: jest.fn(),
+      findMany: jest.fn(),
+      upsert: jest.fn(),
+      update: jest.fn(),
+      updateMany: jest.fn(),
+    },
+    systemConfig: {
+      findUnique: jest.fn(),
+      findMany: jest.fn(async () => []),
+      upsert: jest.fn(),
     },
     $transaction: jest.fn(async (arg: any) => {
       if (typeof arg === 'function') {
@@ -134,9 +158,10 @@ describe('Groups & WebRTC Calls Suite', () => {
     mockConfigService.get.mockImplementation(defaultConfigGet);
 
     const module: TestingModule = await Test.createTestingModule({
-      controllers: [GroupsController, CallsController],
+      controllers: [GroupsController, CommunitiesController, CallsController],
       providers: [
         GroupsService,
+        CommunitiesService,
         CallsService,
         CallsGateway,
         { provide: PrismaService, useValue: mockPrismaService },
@@ -149,6 +174,7 @@ describe('Groups & WebRTC Calls Suite', () => {
 
     groupsController = module.get<GroupsController>(GroupsController);
     groupsService = module.get<GroupsService>(GroupsService);
+    communitiesController = module.get<CommunitiesController>(CommunitiesController);
     callsController = module.get<CallsController>(CallsController);
     callsService = module.get<CallsService>(CallsService);
     callsGateway = module.get<CallsGateway>(CallsGateway);
@@ -683,6 +709,94 @@ describe('Groups & WebRTC Calls Suite', () => {
       expect(mockRedisService.rpush).toHaveBeenCalledWith(
         'call:signals:call-join-1:u1',
         expect.stringContaining('"type":"peer_joined"'),
+      );
+    });
+  });
+
+  describe('Communities: create & list user communities', () => {
+    it('creates a community with OWNER role, announcement conversation, and systemConfig metadata', async () => {
+      mockPrismaService.user.findMany.mockResolvedValueOnce([{ id: 'u2' }]);
+      mockPrismaService.community.create.mockResolvedValueOnce({
+        id: 'comm-1',
+        name: 'Builders Hub',
+        createdBy: 'u1',
+      });
+      mockPrismaService.conversation.create.mockResolvedValueOnce({
+        id: 'conv-comm-1',
+        type: 'COMMUNITY',
+      });
+      mockPrismaService.community.findUnique.mockResolvedValueOnce({
+        id: 'comm-1',
+        name: 'Builders Hub',
+        members: [
+          { userId: 'u1', role: MemberRole.OWNER },
+          { userId: 'u2', role: MemberRole.MEMBER },
+        ],
+      });
+
+      const created = await communitiesController.createCommunity('u1', {
+        name: 'Builders Hub',
+        description: 'Main community',
+        memberIds: ['u2'],
+      });
+
+      expect(created.id).toBe('comm-1');
+      expect(created.announcementConversationId).toBe('conv-comm-1');
+      expect(created.groups).toEqual([]);
+      expect(mockPrismaService.communityMember.createMany).toHaveBeenCalled();
+      expect(mockPrismaService.systemConfig.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { key: 'community_groups:comm-1' },
+        }),
+      );
+    });
+
+    it('lists active user communities with resolved announcementConversationId and linked groups', async () => {
+      mockPrismaService.community.findMany.mockResolvedValueOnce([
+        {
+          id: 'comm-1',
+          name: 'Builders Hub',
+          members: [{ userId: 'u1', role: MemberRole.OWNER }],
+        },
+        {
+          id: 'comm-2',
+          name: 'Empty Hub',
+          members: [{ userId: 'u1', role: MemberRole.MEMBER }],
+        },
+      ]);
+      mockPrismaService.systemConfig.findMany.mockResolvedValueOnce([
+        {
+          key: 'community_groups:comm-1',
+          value: {
+            groupIds: ['grp-1'],
+            announcementConversationId: 'conv-comm-1',
+          },
+        },
+      ]);
+      mockPrismaService.group.findMany.mockResolvedValueOnce([
+        {
+          id: 'grp-1',
+          name: 'Announcements',
+          _count: { members: 4 },
+          conversations: [{ id: 'conv-grp-1' }],
+        },
+      ]);
+
+      const list = await communitiesController.getUserCommunities('u1');
+      expect(list).toHaveLength(2);
+      expect(list[0]).toEqual(
+        expect.objectContaining({
+          id: 'comm-1',
+          announcementConversationId: 'conv-comm-1',
+          groups: [expect.objectContaining({ id: 'grp-1', name: 'Announcements' })],
+        }),
+      );
+      expect(list[1]).toEqual(
+        expect.objectContaining({
+          id: 'comm-2',
+          announcementConversationId: undefined,
+          groups: [],
+        }),
       );
     });
   });

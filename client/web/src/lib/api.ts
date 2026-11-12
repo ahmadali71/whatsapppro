@@ -134,6 +134,17 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   if (config.headers) {
     config.headers['X-Device-Id'] = getOrCreateDeviceId();
   }
+  if (config.data instanceof FormData && config.headers) {
+    const hdrs = config.headers as unknown as { delete?: (name: string) => void } & Record<
+      string,
+      unknown
+    >;
+    if (typeof hdrs.delete === 'function') {
+      hdrs.delete('Content-Type');
+    } else {
+      delete hdrs['Content-Type'];
+    }
+  }
   return config;
 });
 

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { resolveMediaUrl } from '@/lib/api';
 
 interface AvatarProps {
@@ -42,13 +42,19 @@ export const Avatar: React.FC<AvatarProps> = ({
   className = '',
 }) => {
   const resolvedSrc = resolveMediaUrl(src);
+  const [imgError, setImgError] = useState(false);
+
+  useEffect(() => {
+    setImgError(false);
+  }, [resolvedSrc]);
 
   return (
     <div className={`relative inline-flex shrink-0 ${className}`}>
-      {resolvedSrc ? (
+      {resolvedSrc && !imgError ? (
         <img
           src={resolvedSrc}
           alt={name || 'Avatar'}
+          onError={() => setImgError(true)}
           className={`${SIZE_CLASSES[size]} rounded-full object-cover bg-gray-200 dark:bg-[#2a3942]`}
         />
       ) : (

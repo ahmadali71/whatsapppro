@@ -18,6 +18,7 @@ import {
 import { ConversationType, MessageType, User } from '@whatsapp-pro/shared-types';
 import { ConversationWithMeta, useChatStore } from '@/stores/chatStore';
 import { useThemeStore } from '@/stores/themeStore';
+import { API_ORIGIN, extractErrorMessage } from '@/lib/api';
 import { socketManager } from '@/lib/socket';
 import { toast } from '@/stores/toastStore';
 
@@ -180,6 +181,15 @@ export const MessageComposer: React.FC<MessageComposerProps> = ({ conversation, 
     else if (file.type.startsWith('audio/')) messageType = MessageType.AUDIO;
     else messageType = MessageType.DOCUMENT;
 
+    if (
+      messageType !== MessageType.IMAGE &&
+      API_ORIGIN.includes('.vercel.app') &&
+      file.size > 4 * 1024 * 1024
+    ) {
+      toast.error('Files larger than 4 MB cannot be uploaded in serverless mode.');
+      return;
+    }
+
     await sendMediaMessage(conversation.id, {
       file,
       fileName: file.name,
@@ -256,14 +266,18 @@ export const MessageComposer: React.FC<MessageComposerProps> = ({ conversation, 
       question: pollQuestion.trim(),
       options: opts.map((opt, idx) => ({ id: `opt-${idx}`, text: opt, votes: [] })),
     };
-    await sendMessage(conversation.id, {
-      messageType: MessageType.POLL,
-      content: JSON.stringify(payload),
-      encryptE2EE: false,
-    });
-    setPollModalOpen(false);
-    setPollQuestion('');
-    setPollOptions(['', '']);
+    try {
+      await sendMessage(conversation.id, {
+        messageType: MessageType.POLL,
+        content: JSON.stringify(payload),
+        encryptE2EE: false,
+      });
+      setPollModalOpen(false);
+      setPollQuestion('');
+      setPollOptions(['', '']);
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to create poll'));
+    }
   };
 
   const detectCurrentLocation = () => {
@@ -288,21 +302,25 @@ export const MessageComposer: React.FC<MessageComposerProps> = ({ conversation, 
       toast.error('Enter valid latitude and longitude');
       return;
     }
-    await sendMessage(conversation.id, {
-      messageType: MessageType.LOCATION,
-      content: JSON.stringify({
+    try {
+      await sendMessage(conversation.id, {
+        messageType: MessageType.LOCATION,
+        content: JSON.stringify({
+          latitude: lat,
+          longitude: lng,
+          label: locLabel.trim() || undefined,
+          isLive: locIsLive,
+        }),
         latitude: lat,
         longitude: lng,
-        label: locLabel.trim() || undefined,
-        isLive: locIsLive,
-      }),
-      latitude: lat,
-      longitude: lng,
-      encryptE2EE: false,
-    });
-    setLocationModalOpen(false);
-    setLocLabel('');
-    setLocIsLive(false);
+        encryptE2EE: false,
+      });
+      setLocationModalOpen(false);
+      setLocLabel('');
+      setLocIsLive(false);
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to share location'));
+    }
   };
 
   const handleSendContact = async (e: React.FormEvent) => {
@@ -311,16 +329,20 @@ export const MessageComposer: React.FC<MessageComposerProps> = ({ conversation, 
       toast.error('Enter contact name and phone');
       return;
     }
-    await sendMessage(conversation.id, {
-      messageType: MessageType.CONTACT,
-      content: JSON.stringify({ name: contactName.trim(), phone: contactPhone.trim() }),
-      contactName: contactName.trim(),
-      contactPhone: contactPhone.trim(),
-      encryptE2EE: false,
-    });
-    setContactModalOpen(false);
-    setContactName('');
-    setContactPhone('');
+    try {
+      await sendMessage(conversation.id, {
+        messageType: MessageType.CONTACT,
+        content: JSON.stringify({ name: contactName.trim(), phone: contactPhone.trim() }),
+        contactName: contactName.trim(),
+        contactPhone: contactPhone.trim(),
+        encryptE2EE: false,
+      });
+      setContactModalOpen(false);
+      setContactName('');
+      setContactPhone('');
+    } catch (err) {
+      toast.error(extractErrorMessage(err, 'Failed to share contact'));
+    }
   };
 
   return (
